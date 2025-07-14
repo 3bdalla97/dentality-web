@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "313298581579",
+    "project_id": "dentality-1f071",
+    "storage_bucket": "dentality-1f071.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:313298581579:android:6f59ecf3c1be83d9ee75ce",
+        "android_client_info": {
+          "package_name": "com.eshop.dental"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBSn4TpkD7DGDo-VAjMP48_ao9fEseCP1s"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

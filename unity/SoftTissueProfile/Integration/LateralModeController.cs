@@ -221,10 +221,10 @@ namespace Dentality.ProfileAnalysis
         {
             Styles();
             float uiScale = frontalOverlay ? frontalOverlay.uiScale : 1.2f;
-            float s = Mathf.Max(1f, Mathf.Min(Screen.width, Screen.height) / 540f) * uiScale;
+            float s = Mathf.Max(1f, Mathf.Min(UnityEngine.Screen.width, UnityEngine.Screen.height) / 540f) * uiScale;
             var old = GUI.matrix;
             GUI.matrix = Matrix4x4.Scale(new Vector3(s, s, 1f));
-            float vw = Screen.width / s, vh = Screen.height / s;
+            float vw = UnityEngine.Screen.width / s, vh = UnityEngine.Screen.height / s;
 
             // mode button, always visible (bottom centre)
             GUI.color = Color.white;

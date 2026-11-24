@@ -165,42 +165,42 @@ chin and neck line not covered; even lighting.
 
 ---
 
-# Combined scene: frontal + lateral (تتبع الأنسجة الرخوة لتشخيص تقويم الأسنان)
+# Lateral mode added to the existing frontal app (FrontalAnalyzer + FrontalOverlay)
 
-```
-Integration/
-  SoftTissueRunner.cs            one camera → FaceLandmarker (frontal + head yaw) + ImageSegmenter (lateral)
-  SoftTissueDiagnosisManager.cs  auto-switches modes by yaw, Capture button, combined screening summary
-```
+`Integration/LateralModeController.cs` adds a lateral (90°) mode **beside** the existing frontal pipeline:
 
-How it behaves: the patient faces the camera → **frontal mode** (face mesh; profile estimated).
-The patient turns 90° → the face mesh loses the face or yaw is above 30° → after 8 frames, **lateral mode**
-(silhouette; profile measured). Segmentation is skipped while in frontal mode to save CPU.
-**Capture** stores the current view. The summary prefers measured lateral values and marks each line
-as *measured* or *estimated*.
+* Auto: the patient faces the camera → frontal as before. The patient turns 90° (FrontalAnalyzer loses the face for 0.5 s)
+  → lateral: segmentation runs on the same camera, the silhouette is traced, and nasolabial,
+  mentolabial and Ls/Li to E-line are measured.
+* The mm scale for the E-line comes from the last frontal frame (same standard distance), so it is approximate.
+* **Capture** in the lateral panel sends the lip profile (retrusive / normal / protrusive) into the frontal **Ext** tab.
+* The "View:" button (bottom centre) cycles Auto → Frontal → Lateral.
 
 ## Steps
 
-1. **Model:** rename `selfie_multiclass_256x256.tflite` → `selfie_multiclass_256x256.bytes` and put it in the
-   same folder as `face_landmarker_v2.bytes` (search for that file in the Project window).
-   If you build for devices, also put it in `StreamingAssets` wherever the plugin's other `.bytes` files are.
-2. **Scene:** duplicate the sample scene *Face Landmark Detection* and name it `SoftTissueOrthoDiagnosis`.
-3. **Runner:** on the GameObject that has `FaceLandmarkerRunner` (usually "Solution"), remove that component
-   and add `SoftTissueRunner`. Assign **Screen** (the same object the old runner used) and, optionally,
-   the existing **FaceLandmarkerResultAnnotationController**.
-4. **Pipelines:** create an empty GameObject `SoftTissue` and add:
-   `ProfileAnalysisController`, `FaceLandmarkerProfileBridge` (controller = that ProfileAnalysisController),
-   `SideProfileController`, `SideProfileSegmenterBridge` (controller = that SideProfileController),
-   and `SoftTissueDiagnosisManager` (assign all four).
-   Keep this object always active.
-5. **UI (Canvas):**
-   * `FrontalUI` (panel): `ProfileGraph` and a Text, assigned to ProfileAnalysisController.graph and readout.
-   * `LateralUI` (panel): `SideProfileOverlay` stretched over the camera image and a Text, assigned to SideProfileController.overlay and readout.
-   * A Text for the mode label, a Text for the summary, and a Button "Capture", assigned to the manager.
-   * Assign FrontalUI and LateralUI to the manager. It shows only the active one.
-6. **Runner ↔ manager:** set `SoftTissueRunner.manager`.
-7. **Play:** look at the camera (frontal), press Capture. Turn 90° (lateral), press Capture. Read the summary.
-   If the lateral tracing is upside down or mirrored, use the toggles described above.
+1. Model: download `selfie_multiclass_256x256.tflite`, rename it to `.bytes`, and put it in the same folder as `face_landmarker_v2.bytes`.
+2. Add 4 small things to `FrontalOverlay.cs` (see below).
+3. In the scene, add `LateralModeController` to any active GameObject (for example the existing "GameObject" with FrontalAnalyzer).
+   Its references are found automatically.
 
-If you already have your own frontal scripts in this scene, keep them, and call them from
-`SoftTissueDiagnosisManager.OnFace` next to `frontalBridge.OnResult(...)`.
+### FrontalOverlay.cs additions
+
+```csharp
+// 1) field, next to the other public fields
+public bool suspended;    // set by LateralModeController while in lateral view
+
+// 2) public method, anywhere in the class
+public void SetLipProfile(int v) { _lip = Mathf.Clamp(v, 0, 3); }
+
+// 3) first lines of LateUpdate(), right after the null check
+if (suspended)
+{
+    foreach (var l in _lines) l.gameObject.SetActive(false);
+    foreach (var d in _dots) d.gameObject.SetActive(false);
+    foreach (var p in _pts) p.gameObject.SetActive(false);
+    return;
+}
+
+// 4) first line of OnGUI()
+if (suspended) return;
+```

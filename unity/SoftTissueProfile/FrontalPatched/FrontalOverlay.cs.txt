@@ -1,0 +1,1383 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using UnityEngine;
+using UnityEngine.UI;
+
+public class FrontalOverlay : MonoBehaviour
+{
+    public FrontalAnalyzer analyzer;
+    public RectTransform target;          // "Annotatable Screen" (found automatically if empty)
+    public bool mirrorDisplay = false;    // only if the lines appear mirrored on the face
+    public bool swapLeftRight = false;    // press if "R/L" labels are the wrong way round
+    public bool showLines = true;
+    public bool meshOn = true;            // the plugin's own mesh drawing
+    public int midlineMode = 0;           // 0 both, 1 A only, 2 B only
+    public bool suspended;                // [LATERAL] set by LateralModeController while the lateral view is shown
+
+    [Header("UI")]
+    [Range(0.5f, 4f)] public float uiScale = 1.2f;
+    [Range(0.25f, 0.5f)] public float panelWidthFraction = 0.36f;
+    [Range(0.2f, 0.95f)] public float panelOpacity = 0.65f;
+    [Range(0.002f, 0.02f)] public float lineThicknessFraction = 0.004f;
+    [Range(0.005f, 0.05f)] public float dotSizeFraction = 0.016f;
+
+    [Header("Standard frame: distance + position guide (display fractions, origin top-left)")]
+    public bool useFrame = true;
+    [Range(0f, 1f)] public float frameX = 0.28f;
+    [Range(0f, 1f)] public float frameY = 0.08f;
+    [Range(0.05f, 1f)] public float frameW = 0.44f;
+    [Range(0.05f, 1f)] public float frameH = 0.84f;
+    [Range(0f, 1f)] public float eyeLineY = 0.38f;     // where the pupils must be (fraction of the image height)
+    [Range(0f, 1f)] public float centerX = 0.5f;
+    public float refScaleNorm = 0f;                    // iris scale at the standard distance (0 = not set)
+    public float distTolPct = 5f;
+    public float eyeTolFrac = 0.03f;
+    public float centerTolFrac = 0.04f;
+    public bool requireStandard = false;               // dim the numbers while the standard is not met
+
+    [Header("Reference ranges (PLACEHOLDERS: replace with the values of your own references)")]
+    public float chinMildMm = 2f;           // up to this = normal
+    public float chinMarkedMm = 4f;         // above this = marked
+    public float thirdTolPct = 3.5f;        // each third should be 33.3% +- this
+    public float lowerSplitTolPct = 5f;     // Sn-Sto should be 33% of the lower third +- this
+    public float fifthTolPct = 3f;          // each fifth should be 20% +- this
+    public float lateralAsymPct = 3f;       // difference between the two lateral fifths
+    public float alarRatioMin = 0.9f, alarRatioMax = 1.1f;
+    public float lipGapMaxMm = 3f;          // interlabial gap at rest
+    public float cantMaxMm = 1.5f;          // commissure height difference
+    public float jawAsymMaxMm = 3f;
+    public float facialIndexLow = 84f, facialIndexHigh = 90f;
+
+    [Header("Smile analysis reference values (PLACEHOLDERS: replace with your reference)")]
+    public float egdNormMaxMm = 3f;         // gingival display up to this = normal (your table: 1-3 mm)
+    public float egdModerateFromMm = 4f;    // 3-4 mild, 4-8 moderate, above egdSevereFromMm severe
+    public float egdSevereFromMm = 8f;
+    public float sidePatternDiffMm = 2f;    // left/right EGD difference that counts as asymmetric
+    public float lipRestNormMale = 23f, lipRestNormFemale = 21f, lipRestTolMm = 2f;
+    public float lipCommDiffMinMm = 1f, lipCommDiffMaxMm = 3f;   // commissure minus philtrum length
+    public float mobilityNormPct = 27f;     // normal percent elevation; above = hypermobile
+    public float mobilityTolPct = 0f;       // measurement noise is about +-1 mm = +-5%: raise this if you want a margin
+    public float crownRatioNormPct = 80f, crownRatioTolPct = 5f;
+    public float probingNormMaxMm = 3f;     // sulcus probing deeper than this suggests gingival excess / altered passive eruption
+
+    // extraction + smile inputs (patient-specific, not saved between patients)
+    private float _ald;
+    private bool _aldSet;
+    private int _lip;     // 0 unknown, 1 retrusive, 2 normal, 3 protrusive
+    private static readonly string[] LipNames = { "unknown", "retrusive", "normal", "protrusive" };
+    private bool _male = true;
+    private float _probeMm = -1f;
+
+    // last gingival-display result (kept after "Back to live")
+    private bool _hasEgd;
+    private readonly float[] _egdKeep = new float[FrontalAnalyzer.ToothCount];
+    private float _crownRatioKeep, _crownWKeep, _crownLKeep;
+
+    private static readonly Color Ok = new Color(0.45f, 1f, 0.45f);
+    private static readonly Color Warn = new Color(1f, 0.65f, 0.2f);
+    private static readonly Color Bad = new Color(1f, 0.42f, 0.42f);
+    private static readonly Color Yellow = new Color(1f, 0.92f, 0.2f);
+    private static readonly Color Gray = new Color(0.8f, 0.8f, 0.8f);
+
+    private const string Key = "FrontalOverlay.";
+    private const int MeasureLines = 14;      // 0..13 measurement lines, 14..19 standard frame, 20..45 smile analysis
+    private int _tab;
+    private RectTransform[] _lines, _dots;
+    private readonly List<RectTransform> _pts = new List<RectTransform>();
+    private GUIStyle _small, _big, _title, _ana, _right;
+    private string _toast = "";
+    private float _toastUntil;
+    private int _patientId = 1;
+
+    // panel scrolling
+    private float _scrollY, _scrollMax;
+    private bool _scrolling;
+    private Rect _panelRect;
+
+    // standard frame state
+    private bool _stdOk;
+    private float _distRatio = 1f;
+    private readonly List<string> _stdProblems = new List<string>();
+
+    // freeze & adjust (idx >= 0 = mesh landmark, idx < 0 = hand-placed smile point number -(idx+1))
+    private struct PtDef
+    {
+        public string name; public int idx; public Color col;
+        public PtDef(string n, int i, Color c) { name = n; idx = i; col = c; }
+    }
+    private readonly List<PtDef> _cur = new List<PtDef>();
+    private int _curTab = -1;
+    private int _drag = -1;
+    private Vector2 _dragLast;
+    private RawImage _snapImg;
+    private RenderTexture _snapRT;
+    private CanvasGroup _meshGroup;
+
+    private void Start()
+    {
+        if (analyzer == null) analyzer = FindFirstObjectByType<FrontalAnalyzer>();
+        if (target == null)
+        {
+            var go = GameObject.Find("Annotatable Screen");
+            if (go != null) target = go.GetComponent<RectTransform>();
+        }
+        LoadPrefs();
+        if (target == null) { Debug.LogWarning("FrontalOverlay: assign the Target rect (Annotatable Screen)"); return; }
+
+        _lines = new RectTransform[46];
+        for (int i = 0; i < _lines.Length; i++) _lines[i] = MakeSegment("FLine_" + i);
+
+        Color[] dc = { new Color(1f, 0.6f, 0.1f), Yellow, Color.magenta, Color.green, Color.cyan, new Color(1f, 0.2f, 0.2f) };
+        _dots = new RectTransform[dc.Length];
+        for (int i = 0; i < dc.Length; i++)
+        {
+            var go = new GameObject("FDot_" + i, typeof(RectTransform), typeof(Image));
+            var rt = go.GetComponent<RectTransform>();
+            rt.SetParent(target, false);
+            rt.anchorMin = rt.anchorMax = new Vector2(0.5f, 0.5f);
+            var img = go.GetComponent<Image>();
+            img.color = dc[i]; img.raycastTarget = false;
+            _dots[i] = rt;
+        }
+        SetMeshVisible(meshOn);
+    }
+
+    private void OnDestroy()
+    {
+        if (_snapRT != null) _snapRT.Release();
+    }
+
+    private void LateUpdate()
+    {
+        if (target == null || analyzer == null || _lines == null) return;
+        if (suspended)   // [LATERAL] hide everything this overlay draws while the lateral view is shown
+        {
+            foreach (var l in _lines) l.gameObject.SetActive(false);
+            foreach (var d in _dots) d.gameObject.SetActive(false);
+            foreach (var p in _pts) p.gameObject.SetActive(false);
+            return;
+        }
+        analyzer.imageSize = new Vector2(target.rect.width, target.rect.height);
+        EvaluateStandard();
+        DrawGuide();
+        DrawWorld();
+        DrawSmileLines();
+        DrawEditPoints(Mathf.Max(8f, target.rect.height * dotSizeFraction));
+    }
+
+    // ---------------------------------------------------------------- prefs
+
+    private void LoadPrefs()
+    {
+        swapLeftRight = PlayerPrefs.GetInt(Key + "swap", swapLeftRight ? 1 : 0) == 1;
+        mirrorDisplay = PlayerPrefs.GetInt(Key + "mirror", mirrorDisplay ? 1 : 0) == 1;
+        showLines = PlayerPrefs.GetInt(Key + "lines", showLines ? 1 : 0) == 1;
+        meshOn = PlayerPrefs.GetInt(Key + "mesh", meshOn ? 1 : 0) == 1;
+        midlineMode = PlayerPrefs.GetInt(Key + "mid", midlineMode);
+        useFrame = PlayerPrefs.GetInt(Key + "useFrame", useFrame ? 1 : 0) == 1;
+        requireStandard = PlayerPrefs.GetInt(Key + "reqStd", requireStandard ? 1 : 0) == 1;
+        frameX = PlayerPrefs.GetFloat(Key + "fx", frameX);
+        frameY = PlayerPrefs.GetFloat(Key + "fy", frameY);
+        frameW = PlayerPrefs.GetFloat(Key + "fw", frameW);
+        frameH = PlayerPrefs.GetFloat(Key + "fh", frameH);
+        eyeLineY = PlayerPrefs.GetFloat(Key + "eyeY", eyeLineY);
+        centerX = PlayerPrefs.GetFloat(Key + "cx", centerX);
+        refScaleNorm = PlayerPrefs.GetFloat(Key + "refScale", refScaleNorm);
+        _patientId = PlayerPrefs.GetInt(Key + "pid", _patientId);
+        _male = PlayerPrefs.GetInt(Key + "male", 1) == 1;
+    }
+
+    private void SavePrefs()
+    {
+        PlayerPrefs.SetInt(Key + "swap", swapLeftRight ? 1 : 0);
+        PlayerPrefs.SetInt(Key + "mirror", mirrorDisplay ? 1 : 0);
+        PlayerPrefs.SetInt(Key + "lines", showLines ? 1 : 0);
+        PlayerPrefs.SetInt(Key + "mesh", meshOn ? 1 : 0);
+        PlayerPrefs.SetInt(Key + "mid", midlineMode);
+        PlayerPrefs.SetInt(Key + "useFrame", useFrame ? 1 : 0);
+        PlayerPrefs.SetInt(Key + "reqStd", requireStandard ? 1 : 0);
+        PlayerPrefs.SetFloat(Key + "fx", frameX);
+        PlayerPrefs.SetFloat(Key + "fy", frameY);
+        PlayerPrefs.SetFloat(Key + "fw", frameW);
+        PlayerPrefs.SetFloat(Key + "fh", frameH);
+        PlayerPrefs.SetFloat(Key + "eyeY", eyeLineY);
+        PlayerPrefs.SetFloat(Key + "cx", centerX);
+        PlayerPrefs.SetFloat(Key + "refScale", refScaleNorm);
+        PlayerPrefs.SetInt(Key + "pid", _patientId);
+        PlayerPrefs.SetInt(Key + "male", _male ? 1 : 0);
+        PlayerPrefs.Save();
+    }
+
+    private void Toast(string m) { _toast = m; _toastUntil = Time.unscaledTime + 5f; }
+
+    // [LATERAL] called by LateralModeController: 1 retrusive, 2 normal, 3 protrusive (shown in the Ext tab)
+    public void SetLipProfile(int v) { _lip = Mathf.Clamp(v, 0, 3); }
+
+    private float DisplayX(float nx) => mirrorDisplay ? 1f - nx : nx;
+
+    private Camera CanvasCamera()
+    {
+        var canvas = target.GetComponentInParent<Canvas>();
+        return (canvas != null && canvas.renderMode != RenderMode.ScreenSpaceOverlay) ? canvas.worldCamera : null;
+    }
+
+    // normalized display coords (origin top-left) -> position relative to the center of the target rect
+    private Vector2 NormToLocal(float nx, float ny)
+    {
+        var r = target.rect;
+        return new Vector2((nx - 0.5f) * r.width, (0.5f - ny) * r.height);
+    }
+
+    // ---------------------------------------------------------------- standard frame
+
+    private void EvaluateStandard()
+    {
+        _stdProblems.Clear();
+        _stdOk = true;
+        _distRatio = 1f;
+        if (analyzer.frozen) return;
+        if (!analyzer.hasFace) { _stdOk = false; return; }
+
+        // 1) distance: the iris scale (patient independent) against the stored reference
+        if (refScaleNorm > 0f && analyzer.irisScaleNorm > 0f)
+        {
+            _distRatio = analyzer.irisScaleNorm / refScaleNorm;   // > 1 = the face looks bigger = too close
+            float dev = (_distRatio - 1f) * 100f;
+            if (Mathf.Abs(dev) > distTolPct)
+            {
+                _stdOk = false;
+                _stdProblems.Add(dev > 0f ? $"Too close by about {dev:0}%: move back" : $"Too far by about {-dev:0}%: move closer");
+            }
+        }
+        else
+        {
+            _stdOk = false;
+            _stdProblems.Add("Standard not set: put a reference subject at the standard distance and press Set standard");
+        }
+
+        if (!useFrame) return;
+
+        // 2) eye line and centering
+        float dy = analyzer.eyeMidNorm.y - eyeLineY;
+        if (Mathf.Abs(dy) > eyeTolFrac)
+        {
+            _stdOk = false;
+            _stdProblems.Add(dy > 0f ? "Pupils are below the guide line: raise the patient / lower the camera tilt" : "Pupils are above the guide line: lower the patient / raise the camera tilt");
+        }
+        float dx = DisplayX(analyzer.eyeMidNorm.x) - centerX;
+        if (Mathf.Abs(dx) > centerTolFrac)
+        {
+            _stdOk = false;
+            _stdProblems.Add(dx > 0f ? "Face is too far to the right of the frame centre: move left" : "Face is too far to the left of the frame centre: move right");
+        }
+
+        // 3) the whole face inside the frame
+        Rect fb = analyzer.faceBounds;
+        float x0 = DisplayX(fb.xMin), x1 = DisplayX(fb.xMax);
+        float xmin = Mathf.Min(x0, x1), xmax = Mathf.Max(x0, x1);
+        if (xmin < frameX || xmax > frameX + frameW || fb.yMin < frameY || fb.yMax > frameY + frameH)
+        {
+            _stdOk = false;
+            _stdProblems.Add("The face is not fully inside the frame");
+        }
+    }
+
+    // Stores the frame, the eye line and the distance reference from the current (reference) subject.
+    private void SetStandard()
+    {
+        if (analyzer.frozen) { Toast("Go back to live first"); return; }
+        if (!analyzer.hasFace || analyzer.irisScaleNorm <= 0f)
+        {
+            Toast("Set standard needs a detected face with iris landmarks (478 points)");
+            return;
+        }
+        Rect fb = analyzer.faceBounds;
+        float x0 = DisplayX(fb.xMin), x1 = DisplayX(fb.xMax);
+        float xmin = Mathf.Min(x0, x1), xmax = Mathf.Max(x0, x1);
+        float l = Mathf.Clamp01(xmin - 0.06f), r = Mathf.Clamp01(xmax + 0.06f);
+        float t = Mathf.Clamp01(fb.yMin - 0.05f), b = Mathf.Clamp01(fb.yMax + 0.05f);
+        if (r - l < 0.1f || b - t < 0.1f) { Toast("Set standard failed: the face is too small in the image"); return; }
+
+        frameX = l; frameW = r - l; frameY = t; frameH = b - t;
+        eyeLineY = analyzer.eyeMidNorm.y;
+        centerX = DisplayX(analyzer.eyeMidNorm.x);
+        refScaleNorm = analyzer.irisScaleNorm;
+        useFrame = true;
+        SavePrefs();
+        Toast("Standard saved on this device. Keep the camera height, tilt and the floor mark identical for every patient.");
+    }
+
+    private void DrawGuide()
+    {
+        bool show = useFrame && !analyzer.frozen;
+        for (int i = MeasureLines; i < 20; i++) if (!show) _lines[i].gameObject.SetActive(false);
+        if (!show) return;
+
+        Color c = _stdOk ? new Color(0.3f, 1f, 0.3f, 0.95f) : new Color(1f, 0.4f, 0.4f, 0.95f);
+        float ft = Mathf.Max(3f, target.rect.height * 0.007f);
+        Vector2 tl = NormToLocal(frameX, frameY), tr = NormToLocal(frameX + frameW, frameY);
+        Vector2 br = NormToLocal(frameX + frameW, frameY + frameH), bl = NormToLocal(frameX, frameY + frameH);
+        Seg(14, true, tl, tr, c, ft);
+        Seg(15, true, tr, br, c, ft);
+        Seg(16, true, br, bl, c, ft);
+        Seg(17, true, bl, tl, c, ft);
+        Color gl = new Color(1f, 0.95f, 0.3f, 0.7f);
+        Seg(18, true, NormToLocal(frameX, eyeLineY), NormToLocal(frameX + frameW, eyeLineY), gl, ft * 0.6f);   // eye line
+        Seg(19, true, NormToLocal(centerX, frameY), NormToLocal(centerX, frameY + frameH), gl, ft * 0.5f);     // centre line
+    }
+
+    // ---------------------------------------------------------------- drawing on the image
+
+    private RectTransform MakeSegment(string name)
+    {
+        var go = new GameObject(name, typeof(RectTransform), typeof(Image));
+        var rt = go.GetComponent<RectTransform>();
+        rt.SetParent(target, false);
+        rt.anchorMin = rt.anchorMax = new Vector2(0.5f, 0.5f);
+        rt.pivot = new Vector2(0f, 0.5f);
+        go.GetComponent<Image>().raycastTarget = false;
+        return rt;
+    }
+
+    private void Seg(int i, bool visible, Vector2 la, Vector2 lb, Color c, float thickness)
+    {
+        var rt = _lines[i];
+        rt.gameObject.SetActive(visible);
+        if (!visible) return;
+        Vector2 d = lb - la;
+        rt.anchoredPosition = la;
+        rt.sizeDelta = new Vector2(d.magnitude, thickness);
+        rt.localRotation = Quaternion.Euler(0f, 0f, Mathf.Atan2(d.y, d.x) * Mathf.Rad2Deg);
+        rt.GetComponent<Image>().color = c;
+        rt.SetAsLastSibling();
+    }
+
+    // rotated frame (u,v) -> local UI position
+    private Vector2 Loc(Vector2 uv)
+    {
+        Vector2 px = analyzer.ToImage(uv.x, uv.y);
+        float nx = px.x / analyzer.imageSize.x, ny = px.y / analyzer.imageSize.y;
+        if (mirrorDisplay) nx = 1f - nx;
+        return NormToLocal(nx, ny);
+    }
+
+    private void DrawWorld()
+    {
+        bool vis = showLines && analyzer.hasFace && analyzer.pxPerMm > 0f;
+        if (!vis)
+        {
+            for (int i = 0; i < MeasureLines; i++) _lines[i].gameObject.SetActive(false);
+            for (int i = 0; i < _dots.Length; i++) _dots[i].gameObject.SetActive(false);
+            return;
+        }
+
+        float H = target.rect.height;
+        float lt = Mathf.Max(2f, H * lineThicknessFraction), ds = Mathf.Max(8f, H * dotSizeFraction);
+        float eL = analyzer.fifthU[0], eR = analyzer.fifthU[5], mg = (eR - eL) * 0.08f;
+        float vTop = analyzer.vTrichion, vBot = analyzer.vMenton;
+
+        // thirds (orange)
+        float[] vs = { analyzer.vTrichion, analyzer.vGlabella, analyzer.vSubnasale, analyzer.vMenton };
+        Color orange = new Color(1f, 0.6f, 0.1f, 0.9f);
+        for (int i = 0; i < 4; i++) Seg(i, true, Loc(new Vector2(eL - mg, vs[i])), Loc(new Vector2(eR + mg, vs[i])), orange, lt);
+
+        // fifths (magenta)
+        Color magenta = new Color(1f, 0.35f, 1f, 0.85f);
+        for (int k = 0; k < 6; k++)
+            Seg(4 + k, true, Loc(new Vector2(analyzer.fifthU[k], vTop)), Loc(new Vector2(analyzer.fifthU[k], vBot)), magenta, lt * 0.8f);
+
+        // midline A (cyan) and B (white)
+        Vector2 mt = analyzer.uvMidTop, dir = analyzer.uvMidBottom - mt;
+        bool aOk = Mathf.Abs(dir.y) > 1e-3f;
+        if (midlineMode != 2 && aOk)
+        {
+            float t1 = (vTop - mt.y) / dir.y, t2 = (vBot - mt.y) / dir.y;
+            Seg(10, true, Loc(mt + dir * t1), Loc(mt + dir * t2), Color.cyan, lt * 1.3f);
+        }
+        else Seg(10, false, default, default, Color.cyan, lt);
+
+        if (midlineMode != 1) Seg(11, true, Loc(new Vector2(0f, vTop)), Loc(new Vector2(0f, vBot)), new Color(1f, 1f, 1f, 0.7f), lt);
+        else Seg(11, false, default, default, Color.white, lt);
+
+        // chin deviation bracket (red): from the chin to line A at the same height
+        Vector2 c = analyzer.uvChin;
+        float uA = aOk ? mt.x + dir.x * (c.y - mt.y) / dir.y : 0f;
+        Seg(12, true, Loc(new Vector2(uA, c.y)), Loc(c), new Color(1f, 0.25f, 0.25f), lt * 1.8f);
+        Seg(13, false, default, default, Color.white, lt);
+
+        // dots on line A (hidden while adjusting: the editable points are shown instead)
+        bool showDots = !analyzer.frozen;
+        float AtV(float v) => aOk ? mt.x + dir.x * (v - mt.y) / dir.y : 0f;
+        float[] dvv = { analyzer.vTrichion, analyzer.vGlabella, analyzer.vSubnasale, analyzer.vStomion, analyzer.vMenton };
+        for (int i = 0; i < 5; i++)
+        {
+            _dots[i].gameObject.SetActive(showDots);
+            if (!showDots) continue;
+            _dots[i].sizeDelta = new Vector2(ds, ds);
+            _dots[i].anchoredPosition = Loc(new Vector2(AtV(dvv[i]), dvv[i]));
+            _dots[i].SetAsLastSibling();
+        }
+        _dots[5].gameObject.SetActive(showDots);
+        if (showDots)
+        {
+            _dots[5].sizeDelta = new Vector2(ds * 1.4f, ds * 1.4f);
+            _dots[5].anchoredPosition = Loc(c);
+            _dots[5].SetAsLastSibling();
+        }
+    }
+
+    // Smile tab: lower border of the upper lip (magenta), gingival display per tooth, lip length lines
+    private void DrawSmileLines()
+    {
+        bool on = showLines && _tab == 5 && analyzer.hasFace;
+        if (!on)
+        {
+            for (int i = 20; i < _lines.Length; i++) _lines[i].gameObject.SetActive(false);
+            return;
+        }
+        float lt = Mathf.Max(2f, target.rect.height * lineThicknessFraction);
+        Color border = new Color(1f, 0.4f, 0.9f, 0.95f);
+        int m = Mathf.Min(analyzer.innerLipIdx.Length, analyzer.innerU.Length);
+        for (int k = 0; k < 10; k++)
+        {
+            bool v = k + 1 < m;
+            Seg(20 + k, v,
+                v ? Loc(new Vector2(analyzer.innerU[k], analyzer.innerV[k])) : default,
+                v ? Loc(new Vector2(analyzer.innerU[k + 1], analyzer.innerV[k + 1])) : default,
+                border, lt * 1.3f);
+        }
+
+        bool egd = analyzer.frozen && analyzer.customReady;
+        for (int i = 0; i < FrontalAnalyzer.ToothCount; i++)
+        {
+            Color c = analyzer.egdMm[i] > egdNormMaxMm ? new Color(1f, 0.55f, 0.1f) : new Color(0.4f, 1f, 0.4f);
+            Vector2 za = new Vector2(analyzer.zenithU[i], analyzer.zenithV[i]);
+            Vector2 zb = new Vector2(analyzer.zenithU[i], analyzer.borderAtZenithV[i]);
+            Seg(30 + i, egd, egd ? Loc(za) : default, egd ? Loc(zb) : default, c, lt);
+        }
+
+        Vector2 sn = analyzer.uvSn, st = analyzer.uvSt;
+        Color white = new Color(1f, 1f, 1f, 0.9f);
+        Seg(42, true, Loc(sn), Loc(new Vector2(sn.x, st.y)), Color.cyan, lt * 1.5f);                                  // philtrum length
+        Seg(43, true, Loc(new Vector2(analyzer.uvCornerL.x, sn.y)), Loc(analyzer.uvCornerL), white, lt);             // commissure lengths
+        Seg(44, true, Loc(new Vector2(analyzer.uvCornerR.x, sn.y)), Loc(analyzer.uvCornerR), white, lt);
+        Seg(45, true, Loc(new Vector2(analyzer.uvCornerL.x, sn.y)), Loc(new Vector2(analyzer.uvCornerR.x, sn.y)), new Color(1f, 1f, 1f, 0.5f), lt * 0.7f);
+    }
+
+    // ---------------------------------------------------------------- freeze & adjust
+
+    private void SetMeshVisible(bool on)
+    {
+        if (_meshGroup == null)
+        {
+            var t = target.Find("Annotation Layer");
+            if (t == null) return;
+            _meshGroup = t.GetComponent<CanvasGroup>();
+            if (_meshGroup == null) _meshGroup = t.gameObject.AddComponent<CanvasGroup>();
+        }
+        _meshGroup.alpha = on ? 1f : 0f;
+    }
+
+    private void EnterFreeze()
+    {
+        if (!analyzer.hasFace) { Toast("No face detected: nothing to freeze"); return; }
+        if (!analyzer.Freeze()) { Toast("Could not freeze (the face must have all 468/478 landmarks)"); return; }
+        bool img = TakeSnapshot();
+        SetMeshVisible(false);
+        _drag = -1; _curTab = -1;
+        Toast(img ? "Frozen. Drag each point onto its landmark: the numbers update live."
+                  : "Points frozen (the image could not be frozen on this build: keep the patient still), then drag the points.");
+    }
+
+    private void ExitFreeze()
+    {
+        analyzer.Unfreeze();
+        if (_snapImg != null) _snapImg.gameObject.SetActive(false);
+        SetMeshVisible(meshOn);
+        _drag = -1;
+    }
+
+    // copies the current camera image into a RawImage on top of the live feed
+    private bool TakeSnapshot()
+    {
+        RawImage raw = target.GetComponent<RawImage>();
+        if (raw == null || raw.texture == null) return false;
+        Texture src = raw.texture;
+        int w = Mathf.Max(16, src.width), h = Mathf.Max(16, src.height);
+        if (_snapRT == null || _snapRT.width != w || _snapRT.height != h)
+        {
+            if (_snapRT != null) _snapRT.Release();
+            _snapRT = new RenderTexture(w, h, 0, RenderTextureFormat.ARGB32);
+        }
+        Graphics.Blit(src, _snapRT);
+
+        if (_snapImg == null)
+        {
+            var go = new GameObject("FrontalSnapshot", typeof(RectTransform), typeof(RawImage));
+            var rt = go.GetComponent<RectTransform>();
+            rt.SetParent(target, false);
+            rt.anchorMin = Vector2.zero; rt.anchorMax = Vector2.one;
+            rt.offsetMin = Vector2.zero; rt.offsetMax = Vector2.zero;
+            _snapImg = go.GetComponent<RawImage>();
+            _snapImg.raycastTarget = false;
+        }
+        _snapImg.texture = _snapRT;
+        _snapImg.uvRect = raw.uvRect;
+        _snapImg.color = Color.white;
+        _snapImg.gameObject.SetActive(true);
+        _snapImg.transform.SetAsFirstSibling();   // above the live feed, below every point and line
+        return true;
+    }
+
+    // viewer-left to viewer-right (not mirrored); reversed when the camera image is mirrored
+    private string ToothName(int i)
+    {
+        string[] n = { "16", "15", "14", "13", "12", "11", "21", "22", "23", "24", "25", "26" };
+        return swapLeftRight ? n[11 - i] : n[i];
+    }
+
+    private Vector2 PtGet(PtDef d) => d.idx >= 0 ? analyzer.GetNorm(d.idx) : analyzer.GetCustom(-d.idx - 1);
+    private void PtSet(PtDef d, Vector2 v) { if (d.idx >= 0) analyzer.SetNorm(d.idx, v); else analyzer.SetCustom(-d.idx - 1, v); }
+
+    // the points that matter for the tab you are looking at
+    private void BuildCurrent()
+    {
+        if (_curTab == _tab && _cur.Count > 0) return;
+        _curTab = _tab; _cur.Clear(); _drag = -1;
+        var a = analyzer;
+        Color c1 = new Color(1f, 0.6f, 0.1f), c2 = Yellow, c3 = Color.magenta, c4 = Color.green, c5 = Color.cyan, c6 = new Color(1f, 0.3f, 0.3f);
+        switch (_tab)
+        {
+            case 0:   // midline
+                _cur.Add(new PtDef("Pupil A", a.idxIrisA, c2));
+                _cur.Add(new PtDef("Pupil B", a.idxIrisB, c2));
+                _cur.Add(new PtDef("Nasion", a.idxNasion, c5));
+                _cur.Add(new PtDef("Philtrum", a.idxPhiltrum, c5));
+                _cur.Add(new PtDef("Nose tip", a.idxNoseTip, c3));
+                _cur.Add(new PtDef("Chin", a.idxChin, c6));
+                _cur.Add(new PtDef("Jaw A", a.idxJawA, c4));
+                _cur.Add(new PtDef("Jaw B", a.idxJawB, c4));
+                break;
+            case 1:   // fifths
+                _cur.Add(new PtDef("Edge A", a.idxFaceEdgeA, c1));
+                _cur.Add(new PtDef("Outer canthus A", a.idxOuterCanthusA, c2));
+                _cur.Add(new PtDef("Inner canthus A", a.idxInnerCanthusA, c3));
+                _cur.Add(new PtDef("Inner canthus B", a.idxInnerCanthusB, c3));
+                _cur.Add(new PtDef("Outer canthus B", a.idxOuterCanthusB, c2));
+                _cur.Add(new PtDef("Edge B", a.idxFaceEdgeB, c1));
+                _cur.Add(new PtDef("Alar A", a.idxAlarA, c4));
+                _cur.Add(new PtDef("Alar B", a.idxAlarB, c4));
+                _cur.Add(new PtDef("Pupil A", a.idxIrisA, c5));
+                _cur.Add(new PtDef("Pupil B", a.idxIrisB, c5));
+                break;
+            case 4:   // more
+                _cur.Add(new PtDef("Nasion", a.idxNasion, c5));
+                _cur.Add(new PtDef("Menton", a.idxMenton, c6));
+                _cur.Add(new PtDef("Edge A", a.idxFaceEdgeA, c1));
+                _cur.Add(new PtDef("Edge B", a.idxFaceEdgeB, c1));
+                _cur.Add(new PtDef("Stomion up", a.idxStomionUpper, c2));
+                _cur.Add(new PtDef("Stomion low", a.idxStomionLower, c3));
+                _cur.Add(new PtDef("Corner A", a.idxCornerA, c4));
+                _cur.Add(new PtDef("Corner B", a.idxCornerB, c4));
+                _cur.Add(new PtDef("Pupil A", a.idxIrisA, c5));
+                _cur.Add(new PtDef("Pupil B", a.idxIrisB, c5));
+                break;
+            case 5:   // smile
+                _cur.Add(new PtDef("Subnasale", a.idxSubnasale, c3));
+                _cur.Add(new PtDef("Lip border", a.idxStomionUpper, c2));
+                _cur.Add(new PtDef("Cheilion A", a.idxCornerA, c4));
+                _cur.Add(new PtDef("Cheilion B", a.idxCornerB, c4));
+                for (int i = 0; i < FrontalAnalyzer.ToothCount; i++) _cur.Add(new PtDef(ToothName(i), -(i + 1), c1));
+                _cur.Add(new PtDef("distal", -13, c5));
+                _cur.Add(new PtDef("mesial", -14, c5));
+                _cur.Add(new PtDef("edge", -15, c6));
+                break;
+            default:  // thirds and extraction
+                _cur.Add(new PtDef("Trichion", a.idxTrichion, c1));
+                _cur.Add(new PtDef("Glabella", a.idxGlabella, c2));
+                _cur.Add(new PtDef("Subnasale", a.idxSubnasale, c3));
+                _cur.Add(new PtDef("Stomion up", a.idxStomionUpper, c4));
+                _cur.Add(new PtDef("Stomion low", a.idxStomionLower, c5));
+                _cur.Add(new PtDef("Menton", a.idxMenton, c6));
+                _cur.Add(new PtDef("Pupil A", a.idxIrisA, c2));
+                _cur.Add(new PtDef("Pupil B", a.idxIrisB, c2));
+                break;
+        }
+    }
+
+    private RectTransform GetPt(int i)
+    {
+        while (_pts.Count <= i)
+        {
+            var go = new GameObject("EditPt_" + _pts.Count, typeof(RectTransform), typeof(Image));
+            var rt = go.GetComponent<RectTransform>();
+            rt.SetParent(target, false);
+            rt.anchorMin = rt.anchorMax = new Vector2(0.5f, 0.5f);
+            go.GetComponent<Image>().raycastTarget = false;
+            _pts.Add(rt);
+        }
+        return _pts[i];
+    }
+
+    private void DrawEditPoints(float dotSize)
+    {
+        bool on = analyzer.frozen && (_tab != 5 || analyzer.customReady);
+        if (on) BuildCurrent();
+        int n = on ? _cur.Count : 0;
+        for (int i = 0; i < n; i++)
+        {
+            var rt = GetPt(i);
+            rt.gameObject.SetActive(true);
+            rt.GetComponent<Image>().color = _cur[i].col;
+            float sz = dotSize * (i == _drag ? 1.9f : 1.2f);
+            rt.sizeDelta = new Vector2(sz, sz);
+            Vector2 nrm = PtGet(_cur[i]);
+            rt.anchoredPosition = NormToLocal(DisplayX(nrm.x), nrm.y);
+            rt.SetAsLastSibling();
+        }
+        for (int i = n; i < _pts.Count; i++) _pts[i].gameObject.SetActive(false);
+    }
+
+    // screen pixel (origin bottom-left) -> normalized landmark coordinates
+    private bool ScreenToNorm(Vector2 screen, out Vector2 n)
+    {
+        n = default;
+        if (!RectTransformUtility.ScreenPointToLocalPointInRectangle(target, screen, CanvasCamera(), out Vector2 local)) return false;
+        var r = target.rect;
+        Vector2 off = local - r.center;
+        float dx = off.x / r.width + 0.5f, dy = 0.5f - off.y / r.height;
+        n = new Vector2(mirrorDisplay ? 1f - dx : dx, dy);
+        return true;
+    }
+
+    // relative dragging: touch near a point and slide, the point moves by the same amount
+    private void HandleAdjustInput(float rightPx, float leftPx)
+    {
+        if (!analyzer.frozen || _cur.Count == 0) { _drag = -1; return; }
+        Event e = Event.current;
+
+        if (e.type == EventType.MouseDown)
+        {
+            if (e.mousePosition.x > Screen.width - rightPx || e.mousePosition.x < leftPx) return;
+            var screen = new Vector2(e.mousePosition.x, Screen.height - e.mousePosition.y);
+            Camera cam = CanvasCamera();
+            int best = -1; float bestD = Screen.height * 0.15f;
+            for (int i = 0; i < _cur.Count && i < _pts.Count; i++)
+            {
+                if (!_pts[i].gameObject.activeSelf) continue;
+                Vector2 sp = RectTransformUtility.WorldToScreenPoint(cam, _pts[i].position);
+                float d = Vector2.Distance(sp, screen);
+                if (d < bestD) { bestD = d; best = i; }
+            }
+            if (best >= 0 && ScreenToNorm(screen, out Vector2 nn)) { _drag = best; _dragLast = nn; e.Use(); }
+        }
+        else if (e.type == EventType.MouseDrag && _drag >= 0 && _drag < _cur.Count)
+        {
+            var screen = new Vector2(e.mousePosition.x, Screen.height - e.mousePosition.y);
+            if (ScreenToNorm(screen, out Vector2 nn))
+            {
+                PtSet(_cur[_drag], PtGet(_cur[_drag]) + (nn - _dragLast));
+                _dragLast = nn;
+            }
+            e.Use();
+        }
+        else if (e.type == EventType.MouseUp) _drag = -1;
+    }
+
+    private void DrawPointLabels(float s)
+    {
+        Camera cam = CanvasCamera();
+        for (int i = 0; i < _cur.Count && i < _pts.Count; i++)
+        {
+            if (!_pts[i].gameObject.activeSelf) continue;
+            Vector2 sp = RectTransformUtility.WorldToScreenPoint(cam, _pts[i].position);
+            var p = new Vector2(sp.x / s, (Screen.height - sp.y) / s);
+            GUI.color = _cur[i].col;
+            GUI.Label(new Rect(p.x + 9f, p.y - 11f, 150f, 22f), _cur[i].name, _small);
+        }
+    }
+
+    // ---------------------------------------------------------------- smile records
+
+    private void RecordRest()
+    {
+        if (analyzer.RecordRest()) Toast($"Rest recorded: philtrum {analyzer.restPhilMm:0.0} mm, commissure {analyzer.restCommMm:0.0} mm");
+        else Toast("No face detected");
+    }
+
+    private void RecordSmile()
+    {
+        if (analyzer.RecordSmile()) Toast($"Smile recorded: lip length {analyzer.smilePhilMm:0.0} mm");
+        else Toast("No face detected");
+    }
+
+    private void ClearSmile()
+    {
+        analyzer.ClearSmile();
+        _hasEgd = false;
+        _probeMm = -1f;
+        Toast("Smile records cleared");
+    }
+
+    // ---------------------------------------------------------------- record (CSV + screenshot)
+
+    private void SaveRecord()
+    {
+        if (!analyzer.hasFace) { Toast("No face: nothing to save"); return; }
+        var ic = CultureInfo.InvariantCulture;
+        var cols = new List<KeyValuePair<string, string>>();
+        void AddS(string k, string v) => cols.Add(new KeyValuePair<string, string>(k, v));
+        void Add(string k, float v) => AddS(k, v.ToString("0.00", ic));
+
+        AddS("timestamp", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", ic));
+        AddS("patient_id", _patientId.ToString(ic));
+        AddS("sex", _male ? "M" : "F");
+        AddS("device", SystemInfo.deviceModel.Replace(",", " "));
+        AddS("os", SystemInfo.operatingSystem.Replace(",", " "));
+        AddS("mode", analyzer.frozen ? "frozen_adjusted" : "live");
+        Add("screen_w_px", Screen.width); Add("screen_h_px", Screen.height);
+        Add("image_w_px", target.rect.width); Add("image_h_px", target.rect.height);
+        AddS("landmarks", analyzer.landmarkCount.ToString(ic));
+        AddS("scale_source", analyzer.scaleLabel.Replace(",", " "));
+        Add("ipd_mm", analyzer.ipdMm); Add("px_per_mm", analyzer.pxPerMm);
+        Add("iris_scale_norm", analyzer.irisScaleNorm); Add("ref_scale_norm", refScaleNorm);
+        Add("distance_ratio", _distRatio); AddS("standard_ok", _stdOk ? "1" : "0");
+        Add("frame_x", frameX); Add("frame_y", frameY); Add("frame_w", frameW); Add("frame_h", frameH);
+        Add("eye_line_y", eyeLineY); Add("pupil_mid_y", analyzer.eyeMidNorm.y);
+        Add("yaw_deg", analyzer.yawDeg); Add("pitch_deg", analyzer.pitchDeg); Add("roll_deg", analyzer.rollDeg);
+        Add("chin_dev_A_mm_viewer_right_positive", analyzer.chinDevAMm);
+        AddS("chin_side_patient", Mathf.Abs(analyzer.chinDevAMm) < 0.05f ? "-" : Side(analyzer.chinDevAMm));
+        Add("chin_dev_B_mm", analyzer.chinDevBMm);
+        Add("nose_tip_dev_mm", analyzer.noseTipDevBMm); Add("philtrum_dev_mm", analyzer.philtrumDevBMm);
+        Add("jaw_left_mm", analyzer.jawLeftMm); Add("jaw_right_mm", analyzer.jawRightMm);
+        for (int k = 0; k < 5; k++) { Add($"fifth{k + 1}_pct", analyzer.fifthPct[k]); Add($"fifth{k + 1}_mm", analyzer.fifthMm[k]); }
+        Add("alar_intercanthal_ratio", analyzer.alarToIntercanthal); Add("face_width_mm", analyzer.faceWidthMm);
+        for (int k = 0; k < 3; k++) { Add($"third{k + 1}_mm", analyzer.thirdMm[k]); Add($"third{k + 1}_pct", analyzer.thirdPct[k]); }
+        Add("sn_sto_mm", analyzer.lipUpperMm); Add("sto_me_mm", analyzer.lipLowerMm);
+        Add("interlabial_gap_mm", analyzer.interlabialGapMm);
+        Add("commissure_cant_mm", analyzer.commissureCantMm); Add("commissure_cant_deg", analyzer.commissureCantDeg);
+        Add("facial_index", analyzer.facialIndex); Add("face_height_mm", analyzer.faceHeightMm);
+        Add("trichion_offset_mm", analyzer.trichionOffsetMm);
+
+        // smile analysis
+        AddS("rest_recorded", analyzer.hasRest ? "1" : "0");
+        Add("lip_rest_philtrum_mm", analyzer.restPhilMm); Add("lip_rest_commissure_mm", analyzer.restCommMm);
+        AddS("smile_recorded", analyzer.hasSmile ? "1" : "0");
+        Add("lip_smile_philtrum_mm", analyzer.smilePhilMm);
+        float mobPct = analyzer.hasRest && analyzer.hasSmile && analyzer.restPhilMm > 1f ? 100f * (analyzer.restPhilMm - analyzer.smilePhilMm) / analyzer.restPhilMm : 0f;
+        Add("lip_mobility_pct", mobPct);
+        Add("hypermobility_mm", analyzer.hasRest && analyzer.hasSmile ? Mathf.Max(0f, (mobPct - mobilityNormPct) / 100f * analyzer.restPhilMm) : 0f);
+        AddS("egd_recorded", _hasEgd ? "1" : "0");
+        for (int i = 0; i < FrontalAnalyzer.ToothCount; i++) Add("egd_" + ToothName(i) + "_mm", _hasEgd ? _egdKeep[i] : 0f);
+        Add("crown_width_mm", _crownWKeep); Add("crown_length_mm", _crownLKeep); Add("crown_ratio_pct", _crownRatioKeep);
+        Add("probing_depth_mm", _probeMm);
+
+        var sb = new StringBuilder();
+        string path = Path.Combine(Application.persistentDataPath, "frontal_records_v2.csv");
+        if (!File.Exists(path))
+        {
+            for (int i = 0; i < cols.Count; i++) { if (i > 0) sb.Append(','); sb.Append(cols[i].Key); }
+            sb.AppendLine();
+        }
+        for (int i = 0; i < cols.Count; i++) { if (i > 0) sb.Append(','); sb.Append(cols[i].Value); }
+        sb.AppendLine();
+        try
+        {
+            File.AppendAllText(path, sb.ToString());
+            ScreenCapture.CaptureScreenshot($"frontal_{_patientId:000}_{DateTime.Now:HHmmss}.png");   // saved in the same folder on a phone
+            Toast($"Saved record for patient {_patientId}: {path}");
+        }
+        catch (Exception ex) { Toast("Could not save: " + ex.Message); }
+    }
+
+    // ---------------------------------------------------------------- interpretation helpers
+
+    // + = viewer's right. On a normal (non-mirrored) camera the viewer's right is the patient's LEFT.
+    private string Side(float signedViewer)
+    {
+        bool positiveIsPatientLeft = !swapLeftRight;
+        return ((signedViewer > 0f) == positiveIsPatientLeft) ? "L" : "R";
+    }
+
+    private string SignedText(float mm) => Mathf.Abs(mm) < 0.05f ? "0.0 mm" : $"{Side(mm)} {Mathf.Abs(mm):0.0} mm";
+
+    private Color ChinColor(float mm)
+    {
+        float m = Mathf.Abs(mm);
+        return m <= chinMildMm ? Ok : (m <= chinMarkedMm ? Warn : Bad);
+    }
+
+    private string AnaChin(float mm)
+    {
+        float m = Mathf.Abs(mm);
+        if (m <= chinMildMm) return "Within normal limits";
+        string side = Side(mm) == "L" ? "left" : "right";
+        return m <= chinMarkedMm ? $"Mild chin deviation to the patient's {side}" : $"Marked chin deviation to the patient's {side}";
+    }
+
+    private int ThirdStatus(float pct) => pct > 33.3f + thirdTolPct ? 1 : (pct < 33.3f - thirdTolPct ? -1 : 0);
+
+    private string[] FifthNames()
+    {
+        string l = swapLeftRight ? "L" : "R", r = swapLeftRight ? "R" : "L";
+        return new[] { $"F1 lateral {l}", $"F2 eye {l}", "F3 intercanthal", $"F4 eye {r}", $"F5 lateral {r}" };
+    }
+
+    private void FifthsVerdict(List<string> problems)
+    {
+        string[] names = FifthNames();
+        for (int k = 0; k < 5; k++)
+        {
+            float p = analyzer.fifthPct[k];
+            if (Mathf.Abs(p - 20f) <= fifthTolPct) continue;
+            bool wide = p > 20f;
+            string what;
+            if (k == 2) what = wide ? "wide intercanthal distance (telecanthus / hypertelorism tendency)" : "narrow intercanthal distance (hypotelorism tendency)";
+            else if (k == 1 || k == 3) what = wide ? "wide palpebral fissure" : "narrow palpebral fissure";
+            else what = wide ? "wide lateral fifth (face contour wide on that side)" : "narrow lateral fifth (face contour narrow on that side)";
+            problems.Add($"{names[k]} {(wide ? "WIDE" : "NARROW")} ({p:0.0}%): {what}");
+        }
+        if (Mathf.Abs(analyzer.fifthPct[0] - analyzer.fifthPct[4]) > lateralAsymPct)
+            problems.Add("Lateral fifths are asymmetric: possible facial asymmetry or head rotation (check yaw)");
+        if (analyzer.alarToIntercanthal < alarRatioMin) problems.Add($"Alar base narrow vs intercanthal (ratio {analyzer.alarToIntercanthal:0.00})");
+        else if (analyzer.alarToIntercanthal > alarRatioMax) problems.Add($"Alar base wide vs intercanthal (ratio {analyzer.alarToIntercanthal:0.00})");
+    }
+
+    private enum Vert { Normal, Long, Short }
+    private Vert VerticalPattern() { int st = ThirdStatus(analyzer.thirdPct[2]); return st > 0 ? Vert.Long : (st < 0 ? Vert.Short : Vert.Normal); }
+
+    // rule-based decision support: vertical pattern + (optional) ALD and lip profile
+    private void BuildExtraction(out string verdict, out Color col, List<string> lines)
+    {
+        lines.Clear();
+        Vert v = VerticalPattern();
+        int score = 0;
+        if (v == Vert.Long)
+        {
+            score += 1;
+            lines.Add("Long lower third (hyperdivergent tendency): extraction is favoured when space is needed; avoid non-extraction mechanics that extrude molars.");
+        }
+        else if (v == Vert.Short)
+        {
+            score -= 1;
+            lines.Add("Short lower third (hypodivergent tendency): extraction may deepen the bite and flatten the profile; prefer non-extraction when borderline.");
+        }
+        else lines.Add("Normal lower third: the vertical pattern is neutral for the extraction decision.");
+
+        if (!_aldSet && _lip == 0)
+        {
+            verdict = "Vertical factor only";
+            col = Gray;
+            lines.Add("Enter the arch length discrepancy (ALD) and the lip profile (from the lateral E-line) for a full recommendation.");
+            return;
+        }
+
+        if (_aldSet)
+        {
+            if (_ald < 4f) { score -= 2; lines.Add($"ALD {_ald:0} mm (< 4): little space needed."); }
+            else if (_ald <= 8f) lines.Add($"ALD {_ald:0} mm (4-8): borderline; profile and vertical decide.");
+            else { score += 2; lines.Add($"ALD {_ald:0} mm (> 8): significant space needed."); }
+        }
+        if (_lip == 3) { score += 2; lines.Add("Protrusive lips: favours extraction (retraction space)."); }
+        else if (_lip == 1) { score -= 2; lines.Add("Retrusive lips: against extraction (profile would flatten)."); }
+        else if (_lip == 2) lines.Add("Lip profile normal: neutral.");
+
+        if (score >= 3) { verdict = "EXTRACTION INDICATED"; col = Warn; }
+        else if (score >= 1) { verdict = "EXTRACTION FAVOURED (confirm)"; col = Warn; }
+        else if (score == 0) { verdict = "BORDERLINE: decide on ceph/model analysis"; col = Yellow; }
+        else if (score >= -2) { verdict = "NON-EXTRACTION FAVOURED"; col = Ok; }
+        else { verdict = "NON-EXTRACTION"; col = Ok; }
+    }
+
+    // ---------------------------------------------------------------- GUI
+
+    private void EnsureStyles()
+    {
+        if (_small != null) return;
+        _small = new GUIStyle(GUI.skin.label) { fontSize = 13, wordWrap = true };
+        _right = new GUIStyle(_small) { alignment = TextAnchor.UpperRight, wordWrap = false };
+        _title = new GUIStyle(GUI.skin.label) { fontSize = 15, fontStyle = FontStyle.Bold };
+        _big = new GUIStyle(GUI.skin.label) { fontSize = 26, fontStyle = FontStyle.Bold, alignment = TextAnchor.UpperRight };
+        _ana = new GUIStyle(GUI.skin.label) { fontSize = 13, wordWrap = true, fontStyle = FontStyle.Bold };
+    }
+
+    private void Text(ref float y, float x, float w, string text, Color c, GUIStyle st = null)
+    {
+        st = st ?? _small;
+        GUI.color = c;
+        float h = st.CalcHeight(new GUIContent(text), w);
+        GUI.Label(new Rect(x, y, w, h), text, st);
+        y += h + 2f;
+    }
+
+    private void KeyVal(ref float y, float x, float w, string key, string val, Color vc)
+    {
+        GUI.color = Gray;
+        GUI.Label(new Rect(x, y, w * 0.55f, 20f), key, _small);
+        GUI.color = vc;
+        GUI.Label(new Rect(x + w * 0.35f, y, w * 0.65f, 20f), val, _right);
+        y += 21f;
+    }
+
+    private void Big(ref float y, float x, float w, string title, string value, string analysis, Color vc, bool dim)
+    {
+        float a = dim ? 0.55f : 1f;
+        GUI.color = new Color(Gray.r, Gray.g, Gray.b, a);
+        GUI.Label(new Rect(x, y + 6f, w * 0.6f, 22f), title, _small);
+        GUI.color = new Color(vc.r, vc.g, vc.b, a);
+        GUI.Label(new Rect(x + w * 0.35f, y, w * 0.65f, 32f), value, _big);
+        y += 32f;
+        GUI.color = new Color(Yellow.r, Yellow.g, Yellow.b, a);
+        float h = _ana.CalcHeight(new GUIContent(analysis), w);
+        GUI.Label(new Rect(x, y, w, h), analysis, _ana);
+        y += h + 6f;
+    }
+
+    private void DrawBar(float x, float y, float w, float mm, float range, Color c)
+    {
+        GUI.color = new Color(1f, 1f, 1f, 0.15f);
+        GUI.DrawTexture(new Rect(x, y, w, 14f), Texture2D.whiteTexture);
+        float cx = x + w * 0.5f, len = Mathf.Clamp(mm / range, -1f, 1f) * (w * 0.5f);
+        GUI.color = c;
+        GUI.DrawTexture(new Rect(Mathf.Min(cx, cx + len), y + 2f, Mathf.Abs(len), 10f), Texture2D.whiteTexture);
+        GUI.color = Color.white;
+        GUI.DrawTexture(new Rect(cx - 1f, y - 2f, 2f, 18f), Texture2D.whiteTexture);
+        GUI.color = Gray;
+        GUI.Label(new Rect(x, y + 14f, 40f, 18f), swapLeftRight ? "L" : "R", _small);
+        GUI.Label(new Rect(x + w - 40f, y + 14f, 40f, 18f), swapLeftRight ? "R" : "L", _right);
+    }
+
+    // distance bar: left = too far, right = too close, the green zone is the tolerance
+    private void DrawDistanceBar(ref float y, float x, float w)
+    {
+        const float range = 15f;
+        float dev = Mathf.Clamp((_distRatio - 1f) * 100f, -range, range);
+        GUI.color = new Color(1f, 1f, 1f, 0.15f);
+        GUI.DrawTexture(new Rect(x, y, w, 12f), Texture2D.whiteTexture);
+        float zw = w * (distTolPct / range);
+        GUI.color = new Color(0.3f, 1f, 0.3f, 0.45f);
+        GUI.DrawTexture(new Rect(x + w * 0.5f - zw * 0.5f, y, zw, 12f), Texture2D.whiteTexture);
+        GUI.color = Color.white;
+        GUI.DrawTexture(new Rect(x + w * 0.5f + dev / range * w * 0.5f - 2f, y - 2f, 4f, 16f), Texture2D.whiteTexture);
+        GUI.color = Gray;
+        GUI.Label(new Rect(x, y + 12f, 80f, 18f), "far", _small);
+        GUI.Label(new Rect(x + w - 80f, y + 12f, 80f, 18f), "close", _right);
+        y += 32f;
+    }
+
+    private void OnGUI()
+    {
+        if (analyzer == null || target == null) return;
+        if (suspended) return;   // [LATERAL] the lateral panel is drawn by LateralModeController
+        EnsureStyles();
+
+        float s = Mathf.Max(1f, Mathf.Min(Screen.width, Screen.height) / 540f) * uiScale;
+        float vw = Screen.width / s, vh = Screen.height / s;
+        const float btnW = 204f;
+        float leftW = vw * panelWidthFraction;
+
+        // touch input is read in raw GUI pixels, before the scaling matrix is applied
+        HandleAdjustInput((btnW + 12f) * s, (leftW + 12f) * s);
+
+        var old = GUI.matrix;
+        GUI.matrix = Matrix4x4.Scale(new Vector3(s, s, 1f));
+
+        DrawPanel(new Rect(6f, 6f, leftW, vh - 12f));
+        DrawButtons(vw - btnW - 6f, 6f);
+        if (analyzer.frozen) DrawPointLabels(s);
+
+        float ty = 8f;
+        float tx = leftW + 18f, tw = Mathf.Max(200f, vw - btnW - leftW - 36f);
+        if (analyzer.frozen) Text(ref ty, tx, tw, "ADJUST: drag each point onto its landmark. Switch tabs to edit the points of the other measurements. 'Reset edits' restores the frozen points.", new Color(0.8f, 0.95f, 1f));
+        if (Time.unscaledTime < _toastUntil) Text(ref ty, tx, tw, _toast, new Color(0.6f, 0.9f, 1f));
+
+        GUI.matrix = old;
+        GUI.color = Color.white;
+
+        // scrolling the left panel by dragging an empty area (buttons consume their own presses first)
+        Event ev = Event.current;
+        Vector2 mv = ev.mousePosition / s;
+        if (ev.type == EventType.MouseDown && _panelRect.Contains(mv)) _scrolling = true;
+        else if (ev.type == EventType.MouseDrag && _scrolling) { _scrollY -= ev.delta.y / s; ev.Use(); }
+        else if (ev.type == EventType.MouseUp) _scrolling = false;
+    }
+
+    private void DrawPanel(Rect r)
+    {
+        _panelRect = r;
+        GUI.color = new Color(0f, 0f, 0f, panelOpacity);
+        GUI.DrawTexture(r, Texture2D.whiteTexture);
+        float x = r.x + 10f, w = r.width - 20f, y = r.y + 6f;
+
+        if (!analyzer.hasFace)
+        {
+            Text(ref y, x, w, "No face detected. Face the camera.", Bad, _title);
+            return;
+        }
+
+        // pose + scale header
+        Color pc = analyzer.poseOk ? Ok : Bad;
+        Text(ref y, x, w, $"Yaw {analyzer.yawDeg:+0.0;-0.0}°  Pitch {analyzer.pitchDeg:+0.0;-0.0}°  Roll {analyzer.rollDeg:+0.0;-0.0}°  [{analyzer.landmarkCount} pts]", pc);
+        if (!analyzer.poseOk && !string.IsNullOrEmpty(analyzer.poseHint) && !analyzer.frozen) Text(ref y, x, w, analyzer.poseHint, Bad);
+        string scale = analyzer.calibrating ? $"Calibrating scale... {analyzer.calibrationProgress}/{analyzer.calibrationSamples} (hold still, look at the camera)"
+                                             : "Scale: " + analyzer.scaleLabel;
+        Text(ref y, x, w, scale, analyzer.scaleKindOk() ? Gray : Warn);
+
+        // standard frame status + distance bar
+        if (analyzer.frozen) Text(ref y, x, w, "ADJUST MODE (frozen)", Color.cyan, _title);
+        else
+        {
+            if (_stdOk) Text(ref y, x, w, $"STANDARD OK (distance {(_distRatio - 1f) * 100f:+0;-0;0}%)", Ok, _ana);
+            else foreach (var p in _stdProblems) Text(ref y, x, w, p, Warn, _ana);
+            if (refScaleNorm > 0f) DrawDistanceBar(ref y, x, w);
+        }
+
+        // tabs
+        string[] tabs = { "Mid", "5ths", "3rds", "Ext", "More", "Smile" };
+        float tw = w / tabs.Length;
+        for (int i = 0; i < tabs.Length; i++)
+        {
+            GUI.color = _tab == i ? Yellow : Color.white;
+            if (GUI.Button(new Rect(x + i * tw, y, tw - 3f, 28f), tabs[i])) { _tab = i; _scrollY = 0f; }
+        }
+        y += 34f;
+
+        // scrollable content
+        var view = new Rect(r.x, y, r.width, Mathf.Max(40f, r.yMax - y - 4f));
+        GUI.BeginGroup(view);
+        float cx = 10f, cy = -_scrollY;
+        bool dim = !analyzer.frozen && ((analyzer.requireFrontal && !analyzer.poseOk) || (requireStandard && !_stdOk));
+        if (dim) Text(ref cy, cx, w, "Pose or standard not met: values may be unreliable", Bad);
+
+        switch (_tab)
+        {
+            case 0: TabMidline(ref cy, cx, w, dim); break;
+            case 1: TabFifths(ref cy, cx, w, dim); break;
+            case 2: TabThirds(ref cy, cx, w, dim); break;
+            case 3: TabExtraction(ref cy, cx, w); break;
+            case 4: TabMore(ref cy, cx, w); break;
+            default: TabSmile(ref cy, cx, w); break;
+        }
+        GUI.EndGroup();
+
+        float contentH = cy + _scrollY;
+        _scrollMax = Mathf.Max(0f, contentH - view.height);
+        _scrollY = Mathf.Clamp(_scrollY, 0f, _scrollMax);
+        if (_scrollMax > 0f)
+        {
+            float barH = Mathf.Max(24f, view.height * view.height / contentH);
+            float barY = view.y + (view.height - barH) * (_scrollY / _scrollMax);
+            GUI.color = new Color(1f, 1f, 1f, 0.35f);
+            GUI.DrawTexture(new Rect(r.xMax - 6f, barY, 3f, barH), Texture2D.whiteTexture);
+        }
+    }
+
+    private void TabMidline(ref float y, float x, float w, bool dim)
+    {
+        float a = analyzer.chinDevAMm, b = analyzer.chinDevBMm;
+        Big(ref y, x, w, "Chin vs facial midline", SignedText(a), AnaChin(a), ChinColor(a), dim);
+        DrawBar(x, y, w, a, 6f, ChinColor(a));
+        y += 36f;
+        KeyVal(ref y, x, w, "Chin vs vertical axis", SignedText(b), ChinColor(b));
+        KeyVal(ref y, x, w, "Nose tip", SignedText(analyzer.noseTipDevBMm), ChinColor(analyzer.noseTipDevBMm));
+        KeyVal(ref y, x, w, "Philtrum", SignedText(analyzer.philtrumDevBMm), ChinColor(analyzer.philtrumDevBMm));
+        string jl = swapLeftRight ? "L" : "R", jr = swapLeftRight ? "R" : "L";
+        float jd = analyzer.jawRightMm - analyzer.jawLeftMm;
+        KeyVal(ref y, x, w, $"Jaw width {jl} / {jr}", $"{analyzer.jawLeftMm:0.0} / {analyzer.jawRightMm:0.0} mm",
+               Mathf.Abs(jd) <= jawAsymMaxMm ? Ok : Warn);
+        KeyVal(ref y, x, w, "Peak chin shift", $"{Side(analyzer.chinPeakNegMm)} {Mathf.Abs(analyzer.chinPeakNegMm):0.0} / {Side(analyzer.chinPeakPosMm)} {Mathf.Abs(analyzer.chinPeakPosMm):0.0}", Gray);
+        Text(ref y, x, w, "A = nasion-philtrum line (cyan), B = vertical through the eye-line midpoint (white).", Gray);
+    }
+
+    private void TabFifths(ref float y, float x, float w, bool dim)
+    {
+        string[] names = FifthNames();
+        for (int k = 0; k < 5; k++)
+        {
+            float p = analyzer.fifthPct[k];
+            bool okk = Mathf.Abs(p - 20f) <= fifthTolPct;
+            KeyVal(ref y, x, w, names[k], $"{p:0.0}%  ({analyzer.fifthMm[k]:0.0} mm)", okk ? Ok : Warn);
+        }
+        KeyVal(ref y, x, w, "Face width (mesh)", $"{analyzer.faceWidthMm:0} mm", Gray);
+        KeyVal(ref y, x, w, "Alar / intercanthal", $"{analyzer.alarToIntercanthal:0.00}",
+               (analyzer.alarToIntercanthal >= alarRatioMin && analyzer.alarToIntercanthal <= alarRatioMax) ? Ok : Warn);
+        var problems = new List<string>();
+        FifthsVerdict(problems);
+        if (problems.Count == 0) Text(ref y, x, w, "FIFTHS: NORMAL", Yellow, _ana);
+        else foreach (var pr in problems) Text(ref y, x, w, pr, Yellow, _ana);
+        Text(ref y, x, w, "Face edges come from the mesh contour, not the ears: lateral fifths are approximate (adjust them in the frozen view).", Gray);
+    }
+
+    private string ThirdWord(int st) => st > 0 ? "LONG" : (st < 0 ? "SHORT" : "normal");
+
+    private void TabThirds(ref float y, float x, float w, bool dim)
+    {
+        string[] n = { "Upper (Tr-G)", "Middle (G-Sn)", "Lower (Sn-Me)" };
+        float total = analyzer.thirdMm[0] + analyzer.thirdMm[1] + analyzer.thirdMm[2];
+        for (int k = 0; k < 3; k++)
+        {
+            int st = ThirdStatus(analyzer.thirdPct[k]);
+            KeyVal(ref y, x, w, n[k], $"{analyzer.thirdMm[k]:0.0} mm  {analyzer.thirdPct[k]:0}%  {ThirdWord(st)}", st == 0 ? Ok : Warn);
+        }
+        float lu = analyzer.lowerSplitPct;
+        bool splitOk = Mathf.Abs(lu - 33.3f) <= lowerSplitTolPct;
+        KeyVal(ref y, x, w, "  Sn-Sto / Sto-Me", $"{analyzer.lipUpperMm:0.0} / {analyzer.lipLowerMm:0.0} mm  ({lu:0}:{100f - lu:0})", splitOk ? Ok : Warn);
+
+        float ideal = total / 3f;
+        var any = false;
+        for (int k = 2; k >= 0; k--)
+        {
+            int st = ThirdStatus(analyzer.thirdPct[k]);
+            if (st == 0) continue;
+            any = true;
+            string nm = k == 0 ? "UPPER" : (k == 1 ? "MIDDLE" : "LOWER");
+            float diff = analyzer.thirdMm[k] - ideal;
+            if (st > 0)
+            {
+                string extra = k == 2 ? "HIGH VERTICAL: increased lower anterior face height (hyperdivergent tendency)"
+                             : k == 1 ? "HIGH VERTICAL: increased middle third (long nose / maxillary height)"
+                             : "Long upper third (forehead/hairline: check the Trichion offset)";
+                Text(ref y, x, w, $"{nm} third {diff:+0.0;-0.0} mm over ideal. {extra}", Yellow, _ana);
+            }
+            else
+            {
+                string extra = k == 2 ? "decreased lower face height (hypodivergent / deep-bite tendency)"
+                             : k == 1 ? "short middle third" : "short upper third (check the Trichion offset)";
+                Text(ref y, x, w, $"{nm} third SHORT ({diff:+0.0;-0.0} mm): {extra}", Yellow, _ana);
+            }
+        }
+        if (!any) Text(ref y, x, w, "THIRDS: BALANCED", Yellow, _ana);
+        if (ThirdStatus(analyzer.thirdPct[2]) != 0 && !splitOk)
+        {
+            string wh = lu > 33.3f ? "mostly the Sn-Sto segment (long upper lip / maxillary height)" : "mostly the Sto-Me segment (long lower lip / chin height)";
+            Text(ref y, x, w, "Lower third imbalance is " + wh, Yellow, _ana);
+        }
+        string vf = VerticalPattern() == Vert.Long ? "favours extraction" : (VerticalPattern() == Vert.Short ? "disfavours extraction" : "is neutral for extraction");
+        Text(ref y, x, w, $"Vertical factor {vf} (see Ext tab).", Gray);
+    }
+
+    private void TabExtraction(ref float y, float x, float w)
+    {
+        var lines = new List<string>();
+        BuildExtraction(out string verdict, out Color col, lines);
+        Text(ref y, x, w, verdict, col, _title);
+        KeyVal(ref y, x, w, "ALD (crowding)", _aldSet ? $"{_ald:0} mm" : "not set", Gray);
+        KeyVal(ref y, x, w, "Lip profile", LipNames[_lip], Gray);
+        foreach (var l in lines) Text(ref y, x, w, l, Yellow, _ana);
+        Text(ref y, x, w, "Decision support only: the final plan needs ceph, models, growth and patient factors.", Gray);
+    }
+
+    private void TabMore(ref float y, float x, float w)
+    {
+        float gap = analyzer.interlabialGapMm;
+        string gapTxt = gap > 10f ? "mouth open (not at rest)" : (gap > lipGapMaxMm ? "INCOMPETENT lips (suggests vertical excess / short upper lip)" : "competent lips");
+        KeyVal(ref y, x, w, "Interlabial gap", $"{gap:0.0} mm", gap <= lipGapMaxMm ? Ok : Warn);
+        Text(ref y, x, w, gapTxt + " (measure with the lips relaxed)", Yellow, _ana);
+
+        float c = analyzer.commissureCantMm;
+        string lowSide = Side(c);   // viewer-right corner lower when c > 0
+        bool cantOk = Mathf.Abs(c) <= cantMaxMm;
+        KeyVal(ref y, x, w, "Mouth-corner cant", $"{Mathf.Abs(c):0.0} mm / {Mathf.Abs(analyzer.commissureCantDeg):0.0}°", cantOk ? Ok : Warn);
+        Text(ref y, x, w, cantOk ? "Commissures level" : $"Commissure lower on the patient's {(lowSide == "L" ? "left" : "right")} (compare with the occlusal plane)", Yellow, _ana);
+
+        string type = analyzer.facialIndex < facialIndexLow ? "brachyfacial (short, wide face)"
+                    : analyzer.facialIndex > facialIndexHigh ? "dolichofacial (long, narrow face)" : "mesofacial";
+        KeyVal(ref y, x, w, "Facial index (n-me / width)", $"{analyzer.facialIndex:0}", Gray);
+        Text(ref y, x, w, "Face type: " + type + " (width from the mesh contour: approximate)", Yellow, _ana);
+
+        KeyVal(ref y, x, w, "Face height n-Me", $"{analyzer.faceHeightMm:0} mm", Gray);
+        KeyVal(ref y, x, w, "Patient ID (for the CSV)", _patientId.ToString(), Gray);
+    }
+
+    // ---------------------------------------------------------------- smile tab
+
+    private string EgdClass(float mm)
+    {
+        if (mm <= egdNormMaxMm) return "normal";
+        if (mm < egdModerateFromMm) return "MILD excessive gingival display";
+        if (mm <= egdSevereFromMm) return "MODERATE excessive gingival display";
+        return "SEVERE excessive gingival display";
+    }
+
+    private void TabSmile(ref float y, float x, float w)
+    {
+        GUI.color = Color.white;
+        float bw = (w - 6f) / 3f;
+        if (GUI.Button(new Rect(x, y, bw, 28f), "Rec rest")) RecordRest();
+        if (GUI.Button(new Rect(x + bw + 3f, y, bw, 28f), "Rec smile")) RecordSmile();
+        if (GUI.Button(new Rect(x + 2f * (bw + 3f), y, bw, 28f), "Clear")) ClearSmile();
+        y += 32f;
+        float b4 = (w - 9f) / 4f;
+        if (GUI.Button(new Rect(x, y, b4, 28f), _male ? "Male" : "Female")) { _male = !_male; SavePrefs(); }
+        if (GUI.Button(new Rect(x + (b4 + 3f), y, b4, 28f), "Probe -")) _probeMm = _probeMm > 0.6f ? _probeMm - 0.5f : 0.5f;
+        if (GUI.Button(new Rect(x + 2f * (b4 + 3f), y, b4, 28f), "Probe +")) _probeMm = _probeMm < 0f ? 1f : Mathf.Min(10f, _probeMm + 0.5f);
+        if (GUI.Button(new Rect(x + 3f * (b4 + 3f), y, b4, 28f), "Probe x")) _probeMm = -1f;
+        y += 34f;
+
+        bool frozenReady = analyzer.frozen && analyzer.customReady;
+        if (frozenReady)
+        {
+            for (int i = 0; i < FrontalAnalyzer.ToothCount; i++) _egdKeep[i] = analyzer.egdMm[i];
+            _crownRatioKeep = analyzer.crownRatioPct; _crownWKeep = analyzer.crownWidthMm; _crownLKeep = analyzer.crownLengthMm;
+            _hasEgd = true;
+        }
+
+        // ---- step 1: excessive gingival display
+        Text(ref y, x, w, "1. EXCESSIVE GINGIVAL DISPLAY (full smile)", Yellow, _title);
+        float antMean = 0f, postMean = 0f, maxEgd = float.MinValue, leftMean = 0f, rightMean = 0f;
+        if (_hasEgd)
+        {
+            string l1 = "", l2 = "";
+            float m1 = float.MinValue, m2 = float.MinValue;
+            for (int i = 0; i < FrontalAnalyzer.ToothCount; i++)
+            {
+                string t = $"{ToothName(i)}: {_egdKeep[i]:0.0}   ";
+                if (i < 6) { l1 += t; m1 = Mathf.Max(m1, _egdKeep[i]); } else { l2 += t; m2 = Mathf.Max(m2, _egdKeep[i]); }
+                maxEgd = Mathf.Max(maxEgd, _egdKeep[i]);
+            }
+            Text(ref y, x, w, l1, m1 > egdNormMaxMm ? Warn : Ok);
+            Text(ref y, x, w, l2, m2 > egdNormMaxMm ? Warn : Ok);
+            for (int i = 3; i <= 8; i++) antMean += _egdKeep[i];
+            antMean /= 6f;
+            postMean = (_egdKeep[0] + _egdKeep[1] + _egdKeep[2] + _egdKeep[9] + _egdKeep[10] + _egdKeep[11]) / 6f;
+            for (int i = 0; i < 6; i++) leftMean += _egdKeep[i] / 6f;
+            for (int i = 6; i < 12; i++) rightMean += _egdKeep[i] / 6f;
+            KeyVal(ref y, x, w, "Mean anterior (13-23)", $"{antMean:0.0} mm", antMean > egdNormMaxMm ? Warn : Ok);
+            KeyVal(ref y, x, w, "Maximum", $"{maxEgd:0.0} mm", maxEgd > egdNormMaxMm ? Warn : Ok);
+            Text(ref y, x, w, "Class: " + EgdClass(antMean), Yellow, _ana);
+            bool antHigh = antMean > egdNormMaxMm, postHigh = postMean > egdNormMaxMm;
+            string pattern = antHigh && postHigh ? "MIXED (anterior + posterior)" : antHigh ? "ANTERIOR" : postHigh ? "POSTERIOR" : "none";
+            if (Mathf.Abs(leftMean - rightMean) > sidePatternDiffMm) pattern += ", ASYMMETRIC (side difference " + Mathf.Abs(leftMean - rightMean).ToString("0.0") + " mm)";
+            Text(ref y, x, w, "Pattern: " + pattern, Yellow, _ana);
+            if (!analyzer.frozen) Text(ref y, x, w, "(values from the last frozen image)", Gray);
+        }
+        else Text(ref y, x, w, "Ask for a full smile, press Freeze & adjust, then drag each orange point onto the gingival zenith of its tooth. The magenta line is the lower border of the upper lip.", Gray);
+
+        // ---- step 2: lip length at rest
+        y += 4f;
+        Text(ref y, x, w, "2. UPPER LIP LENGTH AT REST", Yellow, _title);
+        float norm = _male ? lipRestNormMale : lipRestNormFemale;
+        bool shortLip = false;
+        if (analyzer.hasRest)
+        {
+            float A = analyzer.restPhilMm, B = analyzer.restCommMm, diff = B - A;
+            string rl = swapLeftRight ? "L" : "R", rr = swapLeftRight ? "R" : "L";
+            shortLip = A < norm - lipRestTolMm;
+            KeyVal(ref y, x, w, "At philtrum (A)", $"{A:0.0} mm  (norm ~{norm:0})", shortLip ? Warn : Ok);
+            KeyVal(ref y, x, w, $"At commissure ({rl} / {rr})", $"{analyzer.restCommLeftMm:0.0} / {analyzer.restCommRightMm:0.0} mm", Gray);
+            KeyVal(ref y, x, w, "Difference B - A", $"{diff:0.0} mm  (norm {lipCommDiffMinMm:0}-{lipCommDiffMaxMm:0})",
+                   (diff >= lipCommDiffMinMm && diff <= lipCommDiffMaxMm) ? Ok : Warn);
+            Text(ref y, x, w, shortLip ? $"SHORT upper lip ({norm - A:0.0} mm below the norm)" : (A > norm + lipRestTolMm ? "Long upper lip" : "Upper lip length within normal limits"), Yellow, _ana);
+        }
+        else Text(ref y, x, w, "Patient relaxed, lips at rest, then press Rec rest.", Gray);
+
+        // ---- step 3: lip mobility
+        y += 4f;
+        Text(ref y, x, w, "3. UPPER LIP MOBILITY (full smile)", Yellow, _title);
+        bool hyper = false; float hm = 0f, mobPct = 0f;
+        if (analyzer.hasRest && analyzer.hasSmile && analyzer.restPhilMm > 1f)
+        {
+            float A = analyzer.restPhilMm, S = analyzer.smilePhilMm, M = A - S;
+            mobPct = 100f * M / A;
+            float excess = mobPct - mobilityNormPct;
+            hyper = excess > mobilityTolPct;
+            hm = Mathf.Max(0f, excess) / 100f * A;
+            KeyVal(ref y, x, w, "At full smile (S)", $"{S:0.0} mm", Gray);
+            KeyVal(ref y, x, w, "Mobility M = A - S", $"{M:0.0} mm", Gray);
+            KeyVal(ref y, x, w, "Percent mobility", $"{mobPct:0.0}%  (norm {mobilityNormPct:0})", hyper ? Warn : Ok);
+            Text(ref y, x, w, hyper ? $"HYPERMOBILE upper lip: excess {excess:0.0}% x {A:0.0} mm = HM {hm:0.0} mm" : "Lip mobility within normal limits", Yellow, _ana);
+        }
+        else Text(ref y, x, w, analyzer.hasRest ? "Ask for a full smile and press Rec smile." : "Record the rest length first (step 2), then the smile.", Gray);
+
+        // ---- step 4: incisor proportions + sulcus depth
+        y += 4f;
+        Text(ref y, x, w, "4. INCISOR LENGTH AND SULCUS DEPTH", Yellow, _title);
+        bool shortCrown = false, deepSulcus = _probeMm > probingNormMaxMm;
+        if (_hasEgd)
+        {
+            shortCrown = _crownRatioKeep > crownRatioNormPct + crownRatioTolPct;
+            KeyVal(ref y, x, w, $"Crown W / L (tooth {ToothName(5)})", $"{_crownWKeep:0.0} / {_crownLKeep:0.0} mm", Gray);
+            KeyVal(ref y, x, w, "Width/length ratio", $"{_crownRatioKeep:0}%  (ideal {crownRatioNormPct:0})", shortCrown ? Warn : Ok);
+            Text(ref y, x, w, shortCrown ? "SHORT clinical crown (altered passive eruption / gingival excess likely)"
+                             : _crownRatioKeep < crownRatioNormPct - crownRatioTolPct ? "Long, narrow clinical crown" : "Crown proportions near the ideal ratio", Yellow, _ana);
+        }
+        else Text(ref y, x, w, "Freeze & adjust, then mark the central incisor: distal and mesial contacts (cyan), gingival zenith and incisal edge (red).", Gray);
+        KeyVal(ref y, x, w, "Sulcus probing depth", _probeMm < 0f ? "not entered" : $"{_probeMm:0.0} mm  (norm ~1, > {probingNormMaxMm:0} deep)", _probeMm < 0f ? Gray : (deepSulcus ? Warn : Ok));
+        if (_probeMm >= 0f) Text(ref y, x, w, deepSulcus ? "Increased sulcus depth: gingival growth / altered passive eruption likely" : "Sulcus depth within normal limits", Yellow, _ana);
+
+        // ---- summary
+        y += 6f;
+        Text(ref y, x, w, "SUMMARY", Yellow, _title);
+        if (!_hasEgd) Text(ref y, x, w, "Complete step 1 (Freeze & adjust) for the diagnosis.", Gray);
+        else if (antMean <= egdNormMaxMm) Text(ref y, x, w, $"Gingival display {antMean:0.0} mm: within normal limits, no gummy smile.", Ok, _ana);
+        else
+        {
+            Text(ref y, x, w, $"GUMMY SMILE: {EgdClass(antMean)} ({antMean:0.0} mm).", Warn, _ana);
+            var causes = new List<string>();
+            var plan = new List<string>();
+            if (analyzer.hasRest && shortLip) { causes.Add("short upper lip"); plan.Add("short lip / vertical maxillary excess: ortho-surgical assessment"); }
+            if (analyzer.hasRest && analyzer.hasSmile && hyper) { causes.Add($"hypermobile upper lip (HM {hm:0.0} mm)"); plan.Add("hypermobile lip: lip repositioning or botulinum toxin"); }
+            if (shortCrown || deepSulcus) { causes.Add("gingival excess / altered passive eruption"); plan.Add("gingival excess: gingivectomy or crown lengthening"); }
+            if (causes.Count == 0)
+            {
+                if (analyzer.hasRest && analyzer.hasSmile && (_probeMm >= 0f || _hasEgd))
+                    causes.Add("no local cause found: consider vertical maxillary excess (check the lateral ceph, e.g. the Ricketts maxillary height angle)");
+                else causes.Add("incomplete data: record rest and smile (steps 2-3) and enter the probing depth");
+            }
+            Text(ref y, x, w, "Likely contributors: " + string.Join("; ", causes), Yellow, _ana);
+            if (plan.Count > 0) Text(ref y, x, w, "Treatment direction: " + string.Join("; ", plan) + (plan.Count > 1 ? " (mixed etiology: combine)" : ""), Yellow, _ana);
+            if (!analyzer.hasRest || !analyzer.hasSmile || _probeMm < 0f)
+                Text(ref y, x, w, "Missing: " + (!analyzer.hasRest ? "rest length; " : "") + (!analyzer.hasSmile ? "smile length; " : "") + (_probeMm < 0f ? "probing depth" : ""), Gray);
+        }
+        Text(ref y, x, w, "Decision support from 2D photos: confirm clinically (ruler or calipers, probing) and with the lateral ceph.", Gray);
+        y += 10f;
+    }
+
+    private void DrawButtons(float x, float y)
+    {
+        const float bw = 100f, bh = 27f, gap = 2f;
+        int idx = 0;
+        bool B(string label)
+        {
+            float bx = x + (idx % 2) * (bw + gap), by = y + (idx / 2) * (bh + gap);
+            idx++;
+            return GUI.Button(new Rect(bx, by, bw, bh), label);
+        }
+
+        GUI.color = Color.white;
+        if (B(analyzer.frozen ? "Back to live" : "Freeze & adjust")) { if (analyzer.frozen) ExitFreeze(); else EnterFreeze(); }
+        if (B("Reset edits")) { analyzer.ResetEdits(); }
+        if (B("Set standard")) SetStandard();
+        if (B(useFrame ? "Frame: on" : "Frame: off")) { useFrame = !useFrame; SavePrefs(); }
+        if (B("Calibrate"))
+        {
+            if (analyzer.frozen) Toast("Go back to live to calibrate");
+            else { analyzer.StartScaleCalibration(); Toast("Look at the camera, keep still: the scale is measured from the iris for a moment."); }
+        }
+        if (B("Clear scale")) analyzer.ClearScale();
+        if (B("IPD -")) analyzer.SetIpd((analyzer.ipdMm > 1f ? analyzer.ipdMm : 63f) - 0.5f);
+        if (B("IPD +")) analyzer.SetIpd((analyzer.ipdMm > 1f ? analyzer.ipdMm : 63f) + 0.5f);
+        if (B("Zero pose")) { analyzer.ZeroPose(); Toast("Pose zeroed: this is now your frontal reference."); }
+        if (B(analyzer.rollCorrect ? "Roll corr: on" : "Roll corr: off")) { analyzer.rollCorrect = !analyzer.rollCorrect; analyzer.SavePrefs(); }
+        if (B(swapLeftRight ? "Swap L/R: on" : "Swap L/R: off")) { swapLeftRight = !swapLeftRight; _curTab = -1; SavePrefs(); }
+        if (B(mirrorDisplay ? "Mirror: on" : "Mirror: off")) { mirrorDisplay = !mirrorDisplay; SavePrefs(); }
+        if (B(showLines ? "Lines: on" : "Lines: off")) { showLines = !showLines; SavePrefs(); }
+        if (B(midlineMode == 0 ? "Midline: A+B" : midlineMode == 1 ? "Midline: A" : "Midline: B")) { midlineMode = (midlineMode + 1) % 3; SavePrefs(); }
+        if (B("Tr up")) { analyzer.trichionOffsetMm += 1f; analyzer.SavePrefs(); }
+        if (B("Tr down")) { analyzer.trichionOffsetMm -= 1f; analyzer.SavePrefs(); }
+        if (B("ALD -")) { _aldSet = true; _ald = Mathf.Clamp(_ald - 1f, -10f, 25f); }
+        if (B("ALD +")) { _aldSet = true; _ald = Mathf.Clamp(_ald + 1f, -10f, 25f); }
+        if (B("ALD clear")) _aldSet = false;
+        if (B("Lips: " + LipNames[_lip])) _lip = (_lip + 1) % 4;
+        if (B("Reset peaks")) analyzer.ResetPeaks();
+        if (B(analyzer.requireFrontal ? "Pose gate: on" : "Pose gate: off")) { analyzer.requireFrontal = !analyzer.requireFrontal; analyzer.SavePrefs(); }
+        if (B(requireStandard ? "Std gate: on" : "Std gate: off")) { requireStandard = !requireStandard; SavePrefs(); }
+        if (B(meshOn ? "Mesh: on" : "Mesh: off")) { meshOn = !meshOn; if (!analyzer.frozen) SetMeshVisible(meshOn); SavePrefs(); }
+        if (B("Save record")) SaveRecord();
+        if (B("ID -")) { _patientId = Mathf.Max(1, _patientId - 1); SavePrefs(); }
+        if (B("ID +")) { _patientId++; SavePrefs(); }
+    }
+}

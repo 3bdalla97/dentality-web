@@ -101,3 +101,64 @@ from ARKit or another tracker.
 Capture a frontal live session and a standard lateral photo of the same patient. Measure the lateral
 photo manually (your current 2D workflow) and compare it per metric (Bland–Altman). Use the bias to
 calibrate offsets or to decide which metrics are reliable enough to show.
+
+---
+
+# Lateral (90°) live analysis: recommended
+
+This mode reads the real silhouette, so its numbers are measured rather than predicted from depth.
+It needs no trained model: person/face segmentation → contour → geometric landmark rules
+(see `Tools/side_profile_poc/` for the Python reference and how each point is defined).
+
+```
+Runtime/SideProfile/
+  SideProfileAnalyzer.cs    contour tracing + Prn, Cm, Sn, Ls, St, Li, B', Pg' + angles and E-line
+  SideProfileController.cs  thread-safe input, camera-pixel alignment, smoothing, readout
+  SideProfileOverlay.cs     draws the tracing over the camera image
+MediaPipeBridge/
+  SideProfileSegmenterBridge.cs   ImageSegmenterResult → controller
+Tools/
+  landmark_tool.html        click landmarks on photos for manual reference values (CSV export)
+```
+
+## Setup
+
+1. Download `selfie_multiclass_256x256.tflite`
+   (https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite)
+   into the plugin's `StreamingAssets` and select it in the **Image Segmentation** sample config.
+   Enable **confidence masks**. Use the CPU delegate if you want the stomion pixel cue (recommended).
+2. In the sample scene add:
+   * a **SideProfileOverlay** on a RectTransform with the same size and position as the camera `RawImage`,
+   * a legacy **Text** for the readout,
+   * a GameObject with **SideProfileController** (assign overlay and text) and
+     **SideProfileSegmenterBridge** (assign the controller).
+3. In `ImageSegmenterRunner.cs` add a field `public Dentality.ProfileAnalysis.SideProfileSegmenterBridge sideProfile;`
+   and call the bridge **before** the masks are disposed:
+
+```csharp
+// LIVE_STREAM
+private void OnImageSegmentationOutput(ImageSegmenterResult result, Image image, long timestamp)
+{
+    sideProfile?.OnResult(result, image);
+    _imageSegmenterResultAnnotationController.DrawLater(result);
+    DisposeAllMasks(result);
+}
+// IMAGE / VIDEO: right after TrySegment / TrySegmentForVideo succeeds
+//     sideProfile?.OnResult(result, image);
+```
+
+4. First run:
+   * If the tracing is upside down, tick **SideProfileController › Masks Bottom Up**.
+   * If it is mirrored against the video, tick **SideProfileOverlay › Mirror X**.
+   * For millimetres, put a ruler at the face plane, then set **mm Per Pixel**
+     (= ruler mm ÷ ruler length in image pixels).
+
+## Validation status
+
+Checked on 10 lateral clinic photos with the Python reference: landmarks looked visually correct on 8/10.
+It failed on very protrusive or everted lips and on a full beard and moustache.
+The C# port has **not been compiled or run** yet (no Unity in the build environment). Expect small fixes on the first import.
+Before clinical use, compare against manual tracings: use `Tools/landmark_tool.html` to collect them.
+
+Capture tips: plain background that contrasts with skin; patient at 90° looking straight ahead;
+chin and neck line not covered; even lighting.

@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Profile Landmark Tool</title>
+<style>
+  :root { --bg:#f6f6f4; --fg:#1d1d1b; --muted:#6b6b66; --line:#d8d8d2; --accent:#0b7a75; --card:#fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161615; --fg:#ecece8; --muted:#a0a09a; --line:#33332f; --accent:#4fc3bc; --card:#1f1f1d; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
+  header { padding:12px 16px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  header h1 { font-size:16px; margin:0 12px 0 0; }
+  button, label.btn { font:inherit; padding:6px 12px; border:1px solid var(--line); background:var(--card); color:var(--fg); border-radius:6px; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  main { display:grid; grid-template-columns: 1fr 300px; gap:12px; padding:12px 16px; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  #wrap { position:relative; background:#000; border-radius:8px; overflow:hidden; min-height:200px; }
+  canvas { display:block; width:100%; height:auto; cursor:crosshair; }
+  aside { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px; }
+  .next { font-size:18px; font-weight:600; color:var(--accent); margin:4px 0 8px; }
+  ol { padding-left:20px; margin:6px 0; } li.done { color:var(--muted); text-decoration:line-through; }
+  table { width:100%; border-collapse:collapse; margin-top:8px; } td { padding:3px 0; border-bottom:1px solid var(--line); }
+  td:last-child { text-align:right; font-variant-numeric: tabular-nums; }
+  .muted { color:var(--muted); font-size:12px; }
+  input[type=number] { width:70px; font:inherit; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Profile Landmark Tool</h1>
+  <label class="btn">Load photos<input id="files" type="file" accept="image/*" multiple hidden></label>
+  <button id="prev">◀ Prev</button><span id="pos" class="muted">no photos</span><button id="next">Next ▶</button>
+  <button id="undo">Undo point (Z)</button>
+  <button id="csv" class="primary">Export CSV</button>
+</header>
+<main>
+  <div id="wrap"><canvas id="cv" width="800" height="600"></canvas></div>
+  <aside>
+    <div class="muted">Click in this order:</div>
+    <div class="next" id="nextpt">Load photos to start</div>
+    <ol id="list"></ol>
+    <div class="muted">Optional mm calibration: click 2 points of a ruler, then type the distance.</div>
+    <div>Ruler: <span id="rulerState" class="muted">not set</span> <input id="rulerMm" type="number" value="10" min="1"> mm
+      <button id="rulerBtn">Set ruler</button></div>
+    <table id="res"></table>
+    <p class="muted">Photos stay in your browser. Nothing is uploaded.</p>
+  </aside>
+</main>
+<script>
+const PTS = [
+  ["Prn", "Pronasale: nose tip"],
+  ["Cm",  "Columella: point on the underside of the nose"],
+  ["Sn",  "Subnasale"],
+  ["Ls",  "Labrale superius"],
+  ["Li",  "Labrale inferius"],
+  ["B'",  "Soft-tissue B point"],
+  ["Pg",  "Soft-tissue pogonion"],
+];
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+let photos = [], cur = 0, rulerMode = false;
+const state = () => photos[cur];
+
+document.getElementById("files").onchange = e => {
+  photos = [...e.target.files].map(f => ({ name: f.name, url: URL.createObjectURL(f), img: null, pts: [], ruler: [] }));
+  cur = 0; load();
+};
+document.getElementById("prev").onclick = () => { if (cur > 0) { cur--; load(); } };
+document.getElementById("next").onclick = () => { if (cur < photos.length - 1) { cur++; load(); } };
+document.getElementById("undo").onclick = undo;
+document.addEventListener("keydown", e => { if (e.key === "z" || e.key === "Z") undo();
+  if (e.key === "ArrowRight") document.getElementById("next").click(); if (e.key === "ArrowLeft") document.getElementById("prev").click(); });
+document.getElementById("rulerBtn").onclick = () => { if (!state()) return; rulerMode = true; state().ruler = []; draw(); };
+document.getElementById("rulerMm").oninput = () => draw();
+document.getElementById("csv").onclick = exportCsv;
+
+function undo() { const s = state(); if (!s) return; if (rulerMode && s.ruler.length) s.ruler.pop(); else s.pts.pop(); draw(); }
+
+function load() {
+  const s = state(); if (!s) return;
+  if (s.img) { draw(); return; }
+  const im = new Image(); im.onload = () => { s.img = im; draw(); }; im.src = s.url;
+}
+
+cv.addEventListener("click", e => {
+  const s = state(); if (!s || !s.img) return;
+  const r = cv.getBoundingClientRect();
+  const p = [(e.clientX - r.left) * cv.width / r.width, (e.clientY - r.top) * cv.height / r.height];
+  if (rulerMode) { s.ruler.push(p); if (s.ruler.length === 2) rulerMode = false; }
+  else if (s.pts.length < PTS.length) s.pts.push(p);
+  draw();
+});
+
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1]], len = v => Math.hypot(v[0], v[1]);
+function ang(a, v, b) { const u = sub(a, v), w = sub(b, v); return Math.acos(Math.max(-1, Math.min(1, (u[0]*w[0] + u[1]*w[1]) / (len(u) * len(w))))) * 180 / Math.PI; }
+function signedToLine(p, a, b, facingRight) {
+  const d = sub(b, a), L = len(d); let n = [d[1] / L, -d[0] / L];
+  if ((n[0] < 0) === facingRight) n = [-n[0], -n[1]];   // + = anterior (towards the face direction)
+  return (p[0] - a[0]) * n[0] + (p[1] - a[1]) * n[1];
+}
+function metrics(s) {
+  if (s.pts.length < PTS.length) return null;
+  const [Prn, Cm, Sn, Ls, Li, B, Pg] = s.pts;
+  const facingRight = Prn[0] > Sn[0];
+  const eLen = len(sub(Pg, Prn));
+  const m = { nasolabial: ang(Cm, Sn, Ls), mentolabial: ang(Li, B, Pg),
+    ls_px: signedToLine(Ls, Prn, Pg, facingRight), li_px: signedToLine(Li, Prn, Pg, facingRight) };
+  m.ls_pct = 100 * m.ls_px / eLen; m.li_pct = 100 * m.li_px / eLen;
+  if (s.ruler.length === 2) { const mmpp = +document.getElementById("rulerMm").value / len(sub(s.ruler[1], s.ruler[0])); m.ls_mm = m.ls_px * mmpp; m.li_mm = m.li_px * mmpp; }
+  return m;
+}
+
+function draw() {
+  const s = state();
+  document.getElementById("pos").textContent = photos.length ? `${cur + 1} / ${photos.length}: ${s.name}` : "no photos";
+  if (!s || !s.img) return;
+  cv.width = s.img.naturalWidth; cv.height = s.img.naturalHeight;
+  ctx.drawImage(s.img, 0, 0);
+  const R = Math.max(4, cv.width / 220), W = Math.max(2, cv.width / 500);
+  ctx.lineWidth = W;
+  const P = Object.fromEntries(s.pts.map((p, i) => [PTS[i][0], p]));
+  const line = (a, b, c, ext = 0) => { const d = sub(b, a); ctx.strokeStyle = c; ctx.beginPath();
+    ctx.moveTo(a[0] - d[0] * ext, a[1] - d[1] * ext); ctx.lineTo(b[0] + d[0] * ext, b[1] + d[1] * ext); ctx.stroke(); };
+  if (P.Prn && P.Pg) line(P.Prn, P.Pg, "#2fd6ec", 0.25);
+  if (P.Sn && P.Cm) line(P.Sn, P.Cm, "#3ccf3c"); if (P.Sn && P.Ls) line(P.Sn, P.Ls, "#3ccf3c");
+  if (P["B'"] && P.Li) line(P["B'"], P.Li, "#8a5cf0"); if (P["B'"] && P.Pg) line(P["B'"], P.Pg, "#8a5cf0");
+  s.pts.forEach((p, i) => { ctx.fillStyle = "#ffd21a"; ctx.beginPath(); ctx.arc(p[0], p[1], R, 0, 7); ctx.fill();
+    ctx.font = `${R * 3}px system-ui`; ctx.lineWidth = R / 2; ctx.strokeStyle = "#000"; ctx.strokeText(PTS[i][0], p[0] + R * 1.6, p[1] + R);
+    ctx.fillStyle = "#fff"; ctx.fillText(PTS[i][0], p[0] + R * 1.6, p[1] + R); ctx.lineWidth = W; });
+  s.ruler.forEach(p => { ctx.fillStyle = "#ff4d4d"; ctx.beginPath(); ctx.arc(p[0], p[1], R, 0, 7); ctx.fill(); });
+  if (s.ruler.length === 2) line(s.ruler[0], s.ruler[1], "#ff4d4d");
+
+  document.getElementById("nextpt").textContent = rulerMode ? `Ruler point ${s.ruler.length + 1} of 2`
+    : s.pts.length < PTS.length ? `${PTS[s.pts.length][0]}: ${PTS[s.pts.length][1]}` : "Done. Next photo ▶";
+  document.getElementById("list").innerHTML = PTS.map((p, i) => `<li class="${i < s.pts.length ? "done" : ""}">${p[0]}: ${p[1]}</li>`).join("");
+  document.getElementById("rulerState").textContent = s.ruler.length === 2 ? "set" : "not set";
+  const m = metrics(s), res = document.getElementById("res");
+  res.innerHTML = m ? [
+    ["Nasolabial", m.nasolabial.toFixed(1) + "°"], ["Mentolabial", m.mentolabial.toFixed(1) + "°"],
+    ["Ls → E-line", m.ls_mm !== undefined ? m.ls_mm.toFixed(1) + " mm" : m.ls_pct.toFixed(1) + " %"],
+    ["Li → E-line", m.li_mm !== undefined ? m.li_mm.toFixed(1) + " mm" : m.li_pct.toFixed(1) + " %"],
+  ].map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("") : "";
+}
+
+function exportCsv() {
+  const head = ["file", ...PTS.flatMap(p => [p[0] + "_x", p[0] + "_y"]), "nasolabial", "mentolabial", "ls_eline_pct", "li_eline_pct", "ls_eline_mm", "li_eline_mm"];
+  const rows = photos.map(s => { const m = metrics(s) || {};
+    const f = v => v === undefined ? "" : (+v).toFixed(2);
+    return [s.name, ...PTS.flatMap((_, i) => s.pts[i] ? s.pts[i].map(v => v.toFixed(1)) : ["", ""]),
+      f(m.nasolabial), f(m.mentolabial), f(m.ls_pct), f(m.li_pct), f(m.ls_mm), f(m.li_mm)].join(","); });
+  const blob = new Blob([[head.join(","), ...rows].join("\n")], { type: "text/csv" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "manual_landmarks.csv"; a.click();
+}
+</script>
+</body>
+</html>

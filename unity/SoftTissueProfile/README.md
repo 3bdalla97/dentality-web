@@ -162,3 +162,45 @@ Before clinical use, compare against manual tracings: use `Tools/landmark_tool.h
 
 Capture tips: plain background that contrasts with skin; patient at 90° looking straight ahead;
 chin and neck line not covered; even lighting.
+
+---
+
+# Combined scene: frontal + lateral (تتبع الأنسجة الرخوة لتشخيص تقويم الأسنان)
+
+```
+Integration/
+  SoftTissueRunner.cs            one camera → FaceLandmarker (frontal + head yaw) + ImageSegmenter (lateral)
+  SoftTissueDiagnosisManager.cs  auto-switches modes by yaw, Capture button, combined screening summary
+```
+
+How it behaves: the patient faces the camera → **frontal mode** (face mesh; profile estimated).
+The patient turns 90° → the face mesh loses the face or yaw is above 30° → after 8 frames, **lateral mode**
+(silhouette; profile measured). Segmentation is skipped while in frontal mode to save CPU.
+**Capture** stores the current view. The summary prefers measured lateral values and marks each line
+as *measured* or *estimated*.
+
+## Steps
+
+1. **Model:** rename `selfie_multiclass_256x256.tflite` → `selfie_multiclass_256x256.bytes` and put it in the
+   same folder as `face_landmarker_v2.bytes` (search for that file in the Project window).
+   If you build for devices, also put it in `StreamingAssets` wherever the plugin's other `.bytes` files are.
+2. **Scene:** duplicate the sample scene *Face Landmark Detection* and name it `SoftTissueOrthoDiagnosis`.
+3. **Runner:** on the GameObject that has `FaceLandmarkerRunner` (usually "Solution"), remove that component
+   and add `SoftTissueRunner`. Assign **Screen** (the same object the old runner used) and, optionally,
+   the existing **FaceLandmarkerResultAnnotationController**.
+4. **Pipelines:** create an empty GameObject `SoftTissue` and add:
+   `ProfileAnalysisController`, `FaceLandmarkerProfileBridge` (controller = that ProfileAnalysisController),
+   `SideProfileController`, `SideProfileSegmenterBridge` (controller = that SideProfileController),
+   and `SoftTissueDiagnosisManager` (assign all four).
+   Keep this object always active.
+5. **UI (Canvas):**
+   * `FrontalUI` (panel): `ProfileGraph` and a Text, assigned to ProfileAnalysisController.graph and readout.
+   * `LateralUI` (panel): `SideProfileOverlay` stretched over the camera image and a Text, assigned to SideProfileController.overlay and readout.
+   * A Text for the mode label, a Text for the summary, and a Button "Capture", assigned to the manager.
+   * Assign FrontalUI and LateralUI to the manager. It shows only the active one.
+6. **Runner ↔ manager:** set `SoftTissueRunner.manager`.
+7. **Play:** look at the camera (frontal), press Capture. Turn 90° (lateral), press Capture. Read the summary.
+   If the lateral tracing is upside down or mirrored, use the toggles described above.
+
+If you already have your own frontal scripts in this scene, keep them, and call them from
+`SoftTissueDiagnosisManager.OnFace` next to `frontalBridge.OnResult(...)`.

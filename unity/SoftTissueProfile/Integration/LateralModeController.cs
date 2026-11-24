@@ -33,7 +33,7 @@ namespace Dentality.ProfileAnalysis
         public ModeSelect mode = ModeSelect.Auto;
         public float frontalMaxYaw = 30f;                  // |yaw| above this is not frontal
         public float lateralDelaySec = 0.5f;               // no frontal face for this long → lateral
-        public bool masksBottomUp;                         // press "Flip V" if the tracing is upside down
+        public bool masksBottomUp = true;                  // Unity masks are usually bottom-up; "Flip V" toggles and remembers it
 
         [Header("Lip profile thresholds (Ricketts E-line, mm; PLACEHOLDERS: use your reference)")]
         public float lsProtrusiveAbove = -2f, liProtrusiveAbove = 0f;
@@ -63,6 +63,7 @@ namespace Dentality.ProfileAnalysis
             if (frontal == null) frontal = FindFirstObjectByType<FrontalAnalyzer>();
             if (frontalOverlay == null) frontalOverlay = FindFirstObjectByType<FrontalOverlay>();
             if (target == null) { var go = GameObject.Find("Annotatable Screen"); if (go) target = go.GetComponent<RectTransform>(); }
+            masksBottomUp = PlayerPrefs.GetInt("Lateral.flipV", masksBottomUp ? 1 : 0) == 1;
             if (frontal == null || target == null) { _error = "LateralModeController: FrontalAnalyzer or Annotatable Screen not found"; Debug.LogError(_error); yield break; }
 
             // wait until the sample's camera is running (the face runner starts it)
@@ -278,7 +279,12 @@ namespace Dentality.ProfileAnalysis
             GUI.color = Color.white;
             float bw = (w - 6f) / 3f;
             if (GUI.Button(new Rect(x, y, bw, 28f), "Capture")) Capture();
-            if (GUI.Button(new Rect(x + bw + 3f, y, bw, 28f), masksBottomUp ? "Flip V: on" : "Flip V: off")) masksBottomUp = !masksBottomUp;
+            if (GUI.Button(new Rect(x + bw + 3f, y, bw, 28f), masksBottomUp ? "Flip V: on" : "Flip V: off"))
+            {
+                masksBottomUp = !masksBottomUp;
+                PlayerPrefs.SetInt("Lateral.flipV", masksBottomUp ? 1 : 0);
+                PlayerPrefs.Save();
+            }
             if (GUI.Button(new Rect(x + 2f * (bw + 3f), y, bw, 28f), "Clear")) _captured = null;
             y += 34f;
 

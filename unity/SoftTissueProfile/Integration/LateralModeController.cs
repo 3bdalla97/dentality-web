@@ -7,6 +7,7 @@
 // "Capture lateral" sends the lip profile (from the E-line) to the frontal Ext tab.
 
 using System.Collections;
+using System.Diagnostics;
 using Mediapipe.Tasks.Vision.ImageSegmenter;
 using Mediapipe.Unity;
 using Mediapipe.Unity.Sample;
@@ -35,6 +36,11 @@ namespace Dentality.ProfileAnalysis
         public float lateralDelaySec = 0.5f;               // no frontal face for this long → lateral
         public bool masksBottomUp = true;                  // Unity masks are usually bottom-up; "Flip V" toggles and remembers it
 
+        [Header("Performance")]
+        [Range(1, 4)] public int segmentEveryNthFrame = 2;  // 1 = every frame (smoothest values, most CPU)
+        [Range(1, 10)] public int pixelsEveryNthSegmentation = 4;  // camera pixels are only needed for the stomion cue
+        public bool showTimings = true;
+
         [Header("Lip profile thresholds (Ricketts E-line, mm; PLACEHOLDERS: use your reference)")]
         public float lsProtrusiveAbove = -2f, liProtrusiveAbove = 0f;
         public float lsRetrusiveBelow = -6f, liRetrusiveBelow = -4f;
@@ -53,6 +59,7 @@ namespace Dentality.ProfileAnalysis
         SideProfileResult _captured;
         float _capLs, _capLi; bool _capMm;
         string _error = "";
+        float _segMs, _fps, _fpsAcc; int _fpsN;
         GUIStyle _small, _title, _big, _ana;
 
         static readonly Color Ok = new Color(0.45f, 1f, 0.45f), Warn = new Color(1f, 0.65f, 0.2f),
@@ -64,7 +71,7 @@ namespace Dentality.ProfileAnalysis
             if (frontalOverlay == null) frontalOverlay = FindFirstObjectByType<FrontalOverlay>();
             if (target == null) { var go = GameObject.Find("Annotatable Screen"); if (go) target = go.GetComponent<RectTransform>(); }
             masksBottomUp = PlayerPrefs.GetInt("Lateral.flipV", masksBottomUp ? 1 : 0) == 1;
-            if (frontal == null || target == null) { _error = "LateralModeController: FrontalAnalyzer or Annotatable Screen not found"; Debug.LogError(_error); yield break; }
+            if (frontal == null || target == null) { _error = "LateralModeController: FrontalAnalyzer or Annotatable Screen not found"; UnityEngine.Debug.LogError(_error); yield break; }
 
             // wait until the sample's camera is running (the face runner starts it)
             yield return new WaitUntil(() => ImageSourceProvider.ImageSource != null && ImageSourceProvider.ImageSource.isPrepared);
@@ -78,7 +85,7 @@ namespace Dentality.ProfileAnalysis
             catch (System.Exception e)
             {
                 _error = $"Lateral model failed to load ({segmentationModel}): {e.Message}";
-                Debug.LogError(_error);
+                UnityEngine.Debug.LogError(_error);
                 yield break;
             }
             _result = ImageSegmenterResult.Alloc(true);
@@ -109,12 +116,16 @@ namespace Dentality.ProfileAnalysis
         {
             var endOfFrame = new WaitForEndOfFrame();
             var opts = new ImageProcessingOptions(rotationDegrees: 0);
+            var sw = new Stopwatch();
             long lastTs = -1;
+            int frameNo = 0, segNo = 0;
+            float lastDone = -1f;
             while (true)
             {
                 yield return endOfFrame;
                 UpdateMode();
                 if (!IsLateral || (frontal != null && frontal.frozen)) continue;
+                if (++frameNo % Mathf.Max(1, segmentEveryNthFrame) != 0) continue;
 
                 var src = ImageSourceProvider.ImageSource;
                 var tex = src.GetCurrentTexture();
@@ -122,19 +133,30 @@ namespace Dentality.ProfileAnalysis
                 if (_pool == null) _pool = new Mediapipe.Unity.Experimental.TextureFramePool(src.textureWidth, src.textureHeight, TextureFormat.RGBA32, 4);
                 if (!_pool.TryGetTextureFrame(out var frame)) continue;
 
+                // asynchronous GPU → CPU copy: the main thread does not wait for the GPU
                 var t = src.GetTransformationOptions();             // same flips as the face runner
-                frame.ReadTextureOnCPU(tex, t.flipHorizontally, t.flipVertically);
+                var req = frame.ReadTextureAsync(tex, t.flipHorizontally, t.flipVertically);
+                yield return new WaitUntil(() => req.done);
+                if (req.hasError) { frame.Release(); continue; }
                 var image = frame.BuildCPUImage();
                 frame.Release();
 
                 int pw = image.Width(), ph = image.Height();
-                if (_pixels == null || _pixels.Length != pw * ph) _pixels = new Color32[pw * ph];
-                bool havePixels = image.TryReadPixelData(_pixels);   // read before the task consumes the image
+                bool wantPixels = segNo++ % Mathf.Max(1, pixelsEveryNthSegmentation) == 0;
+                bool havePixels = false;
+                if (wantPixels)
+                {
+                    if (_pixels == null || _pixels.Length != pw * ph) _pixels = new Color32[pw * ph];
+                    havePixels = image.TryReadPixelData(_pixels);   // read before the task consumes the image
+                }
 
                 long ts = (long)(Time.realtimeSinceStartupAsDouble * 1000.0);
                 if (ts <= lastTs) ts = lastTs + 1;
                 lastTs = ts;
-                if (!_seg.TrySegmentForVideo(image, ts, opts, ref _result)) continue;
+                sw.Restart();
+                bool ok = _seg.TrySegmentForVideo(image, ts, opts, ref _result);
+                _segMs = (float)sw.Elapsed.TotalMilliseconds;
+                if (!ok) continue;
 
                 var masks = _result.confidenceMasks;
                 if (masks == null || masks.Count < 4) { _error = "Wrong model: use selfie_multiclass_256x256"; continue; }
@@ -142,6 +164,11 @@ namespace Dentality.ProfileAnalysis
                 if (_bg == null || _bg.Length != w * h) { _bg = new float[w * h]; _face = new float[w * h]; }
                 if (!masks[0].TryReadChannelNormalized(0, _bg) || !masks[3].TryReadChannelNormalized(0, _face)) continue;
                 _ctl.SubmitFrame(_bg, _face, w, h, havePixels ? _pixels : null, pw, ph, pw);
+
+                // measured rate of lateral updates
+                float now = Time.unscaledTime;
+                if (lastDone > 0f) { _fpsAcc += now - lastDone; if (++_fpsN >= 10) { _fps = _fpsN / Mathf.Max(1e-3f, _fpsAcc); _fpsAcc = 0f; _fpsN = 0; } }
+                lastDone = now;
             }
         }
 
@@ -296,6 +323,8 @@ namespace Dentality.ProfileAnalysis
                                          : $"Ls {_captured.UpperLipToELinePct:+0.0;-0.0}%   Li {_captured.LowerLipToELinePct:+0.0;-0.0}% (no mm: not sent to Ext)", Gray, _small);
             }
             Line(ref y, x, w, "Decision support only: confirm with the lateral ceph.", Gray, _small);
+            if (showTimings && _ctl != null)
+                Line(ref y, x, w, $"Speed: {_fps:0.0} updates/s   segmentation {_segMs:0} ms   analysis {_ctl.AnalysisMs:0} ms   (every {segmentEveryNthFrame} frame(s))", Gray, _small);
         }
 
         void Value(ref float y, float x, float w, string name, string val, bool ok, string analysis)
